@@ -39,7 +39,7 @@
       <details class="details-inline">
         <summary>操作メモ・書き出し仕様</summary>
         <p class="hint hint-bpm">数値欄以外にフォーカスがあるとき <kbd>⌘/Ctrl</kbd>+<kbd>Z</kbd> で元に戻す、<kbd>Shift</kbd> 併用でやり直し。</p>
-        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。書き出しは SoundTouch でピッチ保持・32bit float WAV。初回書き出しのみ CDN でライブラリ取得。下の<strong>再生</strong>は常に画面下にあります。</p>
+        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。書き出しは SoundTouch でピッチ保持・32bit float WAV。初回書き出しのみ CDN でライブラリ取得。<strong>再生</strong>はミックス枠のすぐ上にあります。</p>
       </details>
     </section>
 
@@ -58,6 +58,10 @@
     <section class="panel mix-panel">
       <h2>ミックス（レイヤ）</h2>
       <p class="mix-hint">左の <span class="grip-sample">⠿</span> をドラッグして上下を入れ替え（手前／奥の表示）。音は同時再生でミックスされます。</p>
+      <div class="mix-playbar" role="toolbar" aria-label="再生">
+        <button type="button" id="btnPlay" class="btn primary btn-play-main">再生</button>
+        <button type="button" id="btnStop" class="btn secondary btn-play-main">停止</button>
+      </div>
       <div id="layerStack" class="layer-stack">
         <article class="track layer" data-track="0">
           <div class="layer-head" draggable="true">
@@ -135,11 +139,6 @@
   <footer class="footer">
     <small>音声は送信されません。書き出し時のみ CDN 取得。</small>
   </footer>
-
-  <div class="play-dock" role="toolbar" aria-label="再生">
-    <button type="button" id="btnPlay" class="btn primary btn-play-main">再生</button>
-    <button type="button" id="btnStop" class="btn secondary btn-play-main">停止</button>
-  </div>
 
   <script type="module" src="app.js"></script>
 </body>

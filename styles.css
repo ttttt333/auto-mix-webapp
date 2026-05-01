@@ -71,7 +71,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
-  padding: 0.35rem 0.6rem 3.85rem;
+  padding: 0.35rem 0.6rem 0.5rem;
   max-width: 1400px;
   margin: 0 auto;
   width: 100%;
@@ -194,21 +194,18 @@ body {
   accent-color: var(--accent);
 }
 
-.play-dock {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  z-index: 100;
+.mix-playbar {
+  flex-shrink: 0;
   display: flex;
-  justify-content: center;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 0.65rem;
-  padding: 0.45rem 0.75rem calc(0.45rem + env(safe-area-inset-bottom, 0px));
-  background: rgba(15, 18, 24, 0.94);
-  backdrop-filter: blur(10px);
-  border-top: 1px solid var(--border);
-  box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.35);
+  gap: 0.5rem;
+  margin: 0 0 0.4rem;
+  padding: 0.4rem 0.45rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: rgba(10, 12, 18, 0.85);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.2);
 }
 
 .btn-play-main {
@@ -479,7 +476,7 @@ body {
 .footer {
   flex-shrink: 0;
   text-align: center;
-  padding: 0.15rem 0.5rem 3.5rem;
+  padding: 0.15rem 0.5rem calc(0.25rem + env(safe-area-inset-bottom, 0px));
   color: var(--muted);
   font-size: 0.62rem;
   border-top: 1px solid var(--border);
