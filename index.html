@@ -39,7 +39,7 @@
       <details class="details-inline">
         <summary>操作メモ・書き出し仕様</summary>
         <p class="hint hint-bpm">数値欄以外にフォーカスがあるとき <kbd>⌘/Ctrl</kbd>+<kbd>Z</kbd> で元に戻す、<kbd>Shift</kbd> 併用でやり直し。</p>
-        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。<strong>WAV</strong>は 32bit float、<strong>MP3</strong>は約 192kbps。どちらも SoundTouch でピッチ保持し、画面上の「合計」倍率（基準BPM・推定BPM・速さスライダー）と同じ速さで書き出します。初回書き出しのみ CDN で SoundTouch / lamejs を取得。<strong>再生</strong>はミックス枠のすぐ上にあります。</p>
+        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。<strong>WAV</strong>は 16bit PCM（互換性・容量のバランス）、<strong>MP3</strong>は約 192kbps。どちらも SoundTouch でピッチ保持し、画面上の「合計」倍率（基準BPM・推定BPM・速さスライダー）と同じ速さで書き出します。初回書き出しのみ CDN で SoundTouch / lamejs を取得。<strong>再生</strong>はミックス枠のすぐ上にあります。</p>
       </details>
     </section>
 
@@ -74,7 +74,7 @@
               <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
               <div class="export-bar" role="group" aria-label="ピッチ保持で書き出し（プレビューと同じ合計倍率）">
                 <span class="export-bar-label">書き出し</span>
-                <button type="button" class="btn primary btn-sm btn-export-wav" title="WAV（32bit float・高音質）">WAV</button>
+                <button type="button" class="btn primary btn-sm btn-export-wav" title="WAV（16bit PCM・互換性が高い）">WAV</button>
                 <button type="button" class="btn secondary btn-sm btn-export-mp3" title="MP3（約192kbps・容量が小さめ）">MP3</button>
               </div>
             </div>
@@ -113,7 +113,7 @@
               <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
               <div class="export-bar" role="group" aria-label="ピッチ保持で書き出し（プレビューと同じ合計倍率）">
                 <span class="export-bar-label">書き出し</span>
-                <button type="button" class="btn primary btn-sm btn-export-wav" title="WAV（32bit float・高音質）">WAV</button>
+                <button type="button" class="btn primary btn-sm btn-export-wav" title="WAV（16bit PCM・互換性が高い）">WAV</button>
                 <button type="button" class="btn secondary btn-sm btn-export-mp3" title="MP3（約192kbps・容量が小さめ）">MP3</button>
               </div>
             </div>

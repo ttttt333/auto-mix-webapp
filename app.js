@@ -1,6 +1,6 @@
 /**
  * 波形描画・簡易BPM推定・基準BPMに合わせた playbackRate ミックス
- * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ（プレビューと同じ合計倍率）→ WAV（32bit float）または MP3（lamejs）
+ * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ（プレビューと同じ合計倍率）→ WAV（16bit PCM）または MP3（lamejs）
  */
 
 const HOP = 512;
@@ -106,29 +106,20 @@ function prefetchSoundTouchForExport() {
   void loadSoundTouchModule().catch(() => {});
 }
 
-/** @param {Float32Array[]} parts */
-function concatFloat32Parts(parts) {
-  let len = 0;
-  for (const p of parts) len += p.length;
-  const out = new Float32Array(len);
-  let o = 0;
-  for (const p of parts) {
-    out.set(p, o);
-    o += p.length;
-  }
-  return out;
-}
+/** 書き出しのインターリーブ長（L/R 合算サンプル数）の安全上限 — メモリ対策 */
+const MAX_EXPORT_INTERLEAVED_SAMPLES = 96_000_000;
 
 /**
- * インターリーブ stereo float32 → IEEE float WAV（再量子化なし）
+ * インターリーブ stereo float32 → 16bit PCM WAV（メモリ節約・互換性重視）
  * @param {Float32Array} interleavedStereo length は偶数
  * @param {number} sampleRate
  */
 function interleavedStereoFloatToWavBlob(interleavedStereo, sampleRate) {
   const numChannels = 2;
-  const bytesPerSample = 4;
+  const bytesPerSample = 2;
   const blockAlign = numChannels * bytesPerSample;
-  const dataBytes = interleavedStereo.length * bytesPerSample;
+  const numSamples = interleavedStereo.length;
+  const dataBytes = numSamples * bytesPerSample;
   const buffer = new ArrayBuffer(44 + dataBytes);
   const dv = new DataView(buffer);
   let o = 0;
@@ -142,7 +133,7 @@ function interleavedStereoFloatToWavBlob(interleavedStereo, sampleRate) {
   writeStr("fmt ");
   dv.setUint32(o, 16, true);
   o += 4;
-  dv.setUint16(o, 3, true);
+  dv.setUint16(o, 1, true);
   o += 2;
   dv.setUint16(o, numChannels, true);
   o += 2;
@@ -152,12 +143,17 @@ function interleavedStereoFloatToWavBlob(interleavedStereo, sampleRate) {
   o += 4;
   dv.setUint16(o, blockAlign, true);
   o += 2;
-  dv.setUint16(o, 32, true);
+  dv.setUint16(o, 16, true);
   o += 2;
   writeStr("data");
   dv.setUint32(o, dataBytes, true);
   o += 4;
-  new Float32Array(buffer, o, interleavedStereo.length).set(interleavedStereo);
+  const int16 = new Int16Array(buffer, o, numSamples);
+  for (let i = 0; i < numSamples; i++) {
+    const x = interleavedStereo[i];
+    const c = Math.max(-1, Math.min(1, x));
+    int16[i] = c < 0 ? c * 0x8000 : c * 0x7fff;
+  }
   return new Blob([buffer], { type: "audio/wav" });
 }
 
@@ -182,26 +178,27 @@ async function interleavedStereoFloatToMp3Blob(interleavedStereo, sampleRate, kb
   if (typeof Mp3Encoder !== "function") {
     throw new Error("lamejs の Mp3Encoder が見つかりません");
   }
-  const n = Math.floor(interleavedStereo.length / 2);
-  const left = new Int16Array(n);
-  const right = new Int16Array(n);
-  for (let i = 0, j = 0; i < n; i++, j += 2) {
-    const L = interleavedStereo[j];
-    const R = interleavedStereo[j + 1];
-    const l = Math.max(-1, Math.min(1, L));
-    const r = Math.max(-1, Math.min(1, R));
-    left[i] = l < 0 ? l * 0x8000 : l * 0x7fff;
-    right[i] = r < 0 ? r * 0x8000 : r * 0x7fff;
-  }
+  const framesTotal = Math.floor(interleavedStereo.length / 2);
   const enc = new Mp3Encoder(2, sampleRate, kbps);
-  const block = 1152;
+  const left = new Int16Array(1152);
+  const right = new Int16Array(1152);
   const parts = [];
+  let frameOffset = 0;
   let cycles = 0;
-  for (let i = 0; i < left.length; i += block) {
-    const lc = left.subarray(i, i + block);
-    const rc = right.subarray(i, i + block);
-    const buf = enc.encodeBuffer(lc, rc);
+  while (frameOffset < framesTotal) {
+    const nFrames = Math.min(1152, framesTotal - frameOffset);
+    for (let i = 0; i < nFrames; i++) {
+      const j = (frameOffset + i) * 2;
+      const L = interleavedStereo[j];
+      const R = interleavedStereo[j + 1];
+      const l = Math.max(-1, Math.min(1, L));
+      const r = Math.max(-1, Math.min(1, R));
+      left[i] = l < 0 ? l * 0x8000 : l * 0x7fff;
+      right[i] = r < 0 ? r * 0x8000 : r * 0x7fff;
+    }
+    const buf = enc.encodeBuffer(left.subarray(0, nFrames), right.subarray(0, nFrames));
     if (buf && buf.length > 0) parts.push(new Uint8Array(buf));
+    frameOffset += nFrames;
     cycles += 1;
     if (cycles % 12 === 0) await new Promise((r) => setTimeout(r, 0));
   }
@@ -225,6 +222,7 @@ function downloadBlob(blob, filename) {
 
 /**
  * ピッチを維持したままテンポのみ変更（SoundTouch）
+ * 中間データは1本のバッファに追記し、細切れ配列の結合でメモリを倍にしない。
  * @param {AudioBuffer} inputBuffer
  * @param {number} tempo 1=原曲、>1 高速、<1 低速（playbackRate と同様の時間比）
  */
@@ -236,6 +234,17 @@ async function stretchToInterleavedStereo(inputBuffer, tempo) {
   if (typeof SoundTouch !== "function" || typeof SimpleFilter !== "function" || typeof WebAudioBufferSource !== "function") {
     throw new Error("SoundTouch モジュールの形式が想定と異なります");
   }
+  const dur = inputBuffer.duration;
+  const sr = inputBuffer.sampleRate;
+  const t = Math.max(tempo, 0.05);
+  const estSamples = Math.ceil((dur / t) * sr * 2 * 1.2) + 65536;
+  if (estSamples > MAX_EXPORT_INTERLEAVED_SAMPLES) {
+    const approxMin = estSamples / 2 / sr / 60;
+    throw new Error(
+      `書き出しが長すぎます（推定 約${approxMin.toFixed(1)} 分の音声）。終了秒で範囲を狭めるか、速さを上げてください。`,
+    );
+  }
+
   const st = new SoundTouch();
   st.stretch.setParameters(inputBuffer.sampleRate, 0, 0, 8);
   st.pitch = 1;
@@ -245,18 +254,44 @@ async function stretchToInterleavedStereo(inputBuffer, tempo) {
   const source = new WebAudioBufferSource(inputBuffer);
   const filter = new SimpleFilter(source, st);
 
-  const chunkFrames = 8192;
+  const chunkFrames = 4096;
   const chunk = new Float32Array(chunkFrames * 2);
-  const parts = [];
+  let out = new Float32Array(Math.min(estSamples, MAX_EXPORT_INTERLEAVED_SAMPLES));
+  let offset = 0;
   let cycles = 0;
   while (true) {
     const n = filter.extract(chunk, chunkFrames);
     if (n <= 0) break;
-    parts.push(chunk.slice(0, n * 2));
+    const need = n * 2;
+    if (offset + need > out.length) {
+      const minLen = offset + need;
+      if (minLen > MAX_EXPORT_INTERLEAVED_SAMPLES) {
+        throw new Error("書き出し結果が大きすぎます。終了秒で範囲を狭めてください。");
+      }
+      let nlen = out.length;
+      while (nlen < minLen) {
+        const next = Math.min(Math.ceil(nlen * 1.5) + 65536, MAX_EXPORT_INTERLEAVED_SAMPLES);
+        if (next <= nlen) {
+          throw new Error("書き出し結果が大きすぎます。終了秒で範囲を狭めてください。");
+        }
+        nlen = next;
+      }
+      try {
+        const grown = new Float32Array(nlen);
+        grown.set(out.subarray(0, offset));
+        out = grown;
+      } catch {
+        throw new Error(
+          "メモリが足りず書き出しを完了できませんでした（Array buffer allocation failed）。終了秒で短くするか、別のブラウザ・タブを減らしてお試しください。",
+        );
+      }
+    }
+    out.set(chunk.subarray(0, need), offset);
+    offset += need;
     cycles += 1;
     if (cycles % 8 === 0) await new Promise((r) => setTimeout(r, 0));
   }
-  return concatFloat32Parts(parts);
+  return out.subarray(0, offset);
 }
 
 /**
@@ -279,7 +314,7 @@ function buildExportFilename(originalName, trackIndex, masterBpm, totalRate, for
   if (format === "mp3") {
     return `${base}_master${mb}bpm${rateTag}_pitchhold_${MP3_KBPS}k.mp3`;
   }
-  return `${base}_master${mb}bpm${rateTag}_pitchhold_IEEE.wav`;
+  return `${base}_master${mb}bpm${rateTag}_pitchhold_16bit.wav`;
 }
 
 /** @type {AudioContext | null} */
@@ -1024,7 +1059,7 @@ function init() {
       let detail = err instanceof Error ? err.message : String(err);
       if (detail.length > 900) detail = `${detail.slice(0, 900)}…`;
       window.alert(
-        `書き出しに失敗しました。\n\n${detail}\n\n（初回のみピッチ保持用ライブラリをネットワークから読み込みます。社内 Wi‑Fi や広告ブロッカーで失敗することがあります。）`,
+        `書き出しに失敗しました。\n\n${detail}\n\n（長い曲やタブの多い環境ではメモリ不足（Array buffer allocation failed）になることがあります。終了秒で短くするか、他のアプリを閉じて再試行してください。広告ブロッカーで CDN が失敗することもあります。）`,
       );
     } finally {
       restoreExportButtons(exportBtns);
