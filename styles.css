@@ -369,6 +369,26 @@ body {
   margin-bottom: 0.25rem;
 }
 
+.export-bar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.28rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.export-bar-label {
+  font-size: 0.62rem;
+  font-weight: 650;
+  color: var(--muted);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
 .file-input {
   font-size: 0.68rem;
   color: var(--muted);

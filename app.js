@@ -1,22 +1,36 @@
 /**
  * 波形描画・簡易BPM推定・基準BPMに合わせた playbackRate ミックス
- * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ（プレビューと同じ合計倍率）→ 32bit float WAV
+ * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ（プレビューと同じ合計倍率）→ WAV（32bit float）または MP3（lamejs）
  */
 
 const HOP = 512;
 const FRAME = 2048;
 
+/** MP3 ビットレート（固定） */
+const MP3_KBPS = 192;
+
 /** 固定バージョン（CDN import 用） */
 const SOUNDTOUCH_ESM = "https://esm.sh/@soundtouchjs/core@1.0.10";
+const LAMEJS_ESM = "https://esm.sh/lamejs@1.2.1";
 
 /** @type {Promise<Record<string, unknown>> | null} */
 let soundTouchModulePromise = null;
+
+/** @type {Promise<unknown> | null} */
+let lameJsModulePromise = null;
 
 function loadSoundTouchModule() {
   if (!soundTouchModulePromise) {
     soundTouchModulePromise = import(/* @vite-ignore */ /* webpackIgnore: true */ SOUNDTOUCH_ESM);
   }
   return soundTouchModulePromise;
+}
+
+function loadLameJsModule() {
+  if (!lameJsModulePromise) {
+    lameJsModulePromise = import(/* @vite-ignore */ /* webpackIgnore: true */ LAMEJS_ESM);
+  }
+  return lameJsModulePromise;
 }
 
 /** @param {Float32Array[]} parts */
@@ -74,6 +88,55 @@ function interleavedStereoFloatToWavBlob(interleavedStereo, sampleRate) {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+/**
+ * インターリーブ stereo float32 → MP3（lamejs）
+ * @param {Float32Array} interleavedStereo
+ * @param {number} sampleRate
+ * @param {number} kbps
+ */
+async function interleavedStereoFloatToMp3Blob(interleavedStereo, sampleRate, kbps) {
+  const mod = await loadLameJsModule();
+  const d =
+    mod && typeof mod === "object" && "default" in /** @type {object} */ (mod) ? /** @type {{ default: unknown }} */ (mod).default : mod;
+  const pick = (o) =>
+    o && typeof o === "object" && "Mp3Encoder" in /** @type {object} */ (o) ? /** @type {{ Mp3Encoder: unknown }} */ (o).Mp3Encoder : null;
+  const Mp3Encoder = (() => {
+    const a = pick(d);
+    if (typeof a === "function") return a;
+    const b = pick(mod);
+    return typeof b === "function" ? b : null;
+  })();
+  if (typeof Mp3Encoder !== "function") {
+    throw new Error("lamejs の Mp3Encoder が見つかりません");
+  }
+  const n = Math.floor(interleavedStereo.length / 2);
+  const left = new Int16Array(n);
+  const right = new Int16Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 2) {
+    const L = interleavedStereo[j];
+    const R = interleavedStereo[j + 1];
+    const l = Math.max(-1, Math.min(1, L));
+    const r = Math.max(-1, Math.min(1, R));
+    left[i] = l < 0 ? l * 0x8000 : l * 0x7fff;
+    right[i] = r < 0 ? r * 0x8000 : r * 0x7fff;
+  }
+  const enc = new Mp3Encoder(2, sampleRate, kbps);
+  const block = 1152;
+  const parts = [];
+  let cycles = 0;
+  for (let i = 0; i < left.length; i += block) {
+    const lc = left.subarray(i, i + block);
+    const rc = right.subarray(i, i + block);
+    const buf = enc.encodeBuffer(lc, rc);
+    if (buf && buf.length > 0) parts.push(new Uint8Array(buf));
+    cycles += 1;
+    if (cycles % 12 === 0) await new Promise((r) => setTimeout(r, 0));
+  }
+  const end = enc.flush();
+  if (end && end.length > 0) parts.push(new Uint8Array(end));
+  return new Blob(parts, { type: "audio/mpeg" });
+}
+
 /** @param {Blob} blob @param {string} filename */
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -128,8 +191,9 @@ async function stretchToInterleavedStereo(inputBuffer, tempo) {
  * @param {number} trackIndex
  * @param {number} masterBpm
  * @param {number} [totalRate] プレビューと同じ合計倍率（ファイル名に含める）
+ * @param {"wav" | "mp3"} format
  */
-function buildExportFilename(originalName, trackIndex, masterBpm, totalRate) {
+function buildExportFilename(originalName, trackIndex, masterBpm, totalRate, format) {
   const raw = originalName || `track${trackIndex + 1}`;
   const base = raw
     .replace(/[/\\?%*:|"<>]/g, "_")
@@ -139,6 +203,9 @@ function buildExportFilename(originalName, trackIndex, masterBpm, totalRate) {
     totalRate != null && Number.isFinite(totalRate)
       ? `_total${String(Math.round(totalRate * 1000) / 1000).replace(".", "p")}x`
       : "";
+  if (format === "mp3") {
+    return `${base}_master${mb}bpm${rateTag}_pitchhold_${MP3_KBPS}k.mp3`;
+  }
   return `${base}_master${mb}bpm${rateTag}_pitchhold_IEEE.wav`;
 }
 
@@ -835,9 +902,11 @@ function init() {
   /**
    * @param {TrackState} track
    * @param {number} trackIndex
-   * @param {HTMLButtonElement} exportBtn
+   * @param {HTMLButtonElement} triggerBtn
+   * @param {HTMLButtonElement[]} exportBtns
+   * @param {"wav" | "mp3"} format
    */
-  async function exportPitchHoldWav(track, trackIndex, exportBtn) {
+  async function exportPitchHold(track, trackIndex, triggerBtn, exportBtns, format) {
     if (!track.buffer) {
       window.alert("先にオーディオファイルを読み込んでください。");
       return;
@@ -856,24 +925,29 @@ function init() {
       if (!ok) return;
     }
 
-    exportBtn.disabled = true;
-    const prevLabel = exportBtn.textContent;
-    exportBtn.textContent = "処理中…";
+    const labels = exportBtns.map((btn) => btn.textContent ?? "");
+    for (const btn of exportBtns) btn.disabled = true;
+    triggerBtn.textContent = "処理中…";
     try {
       const { start, end } = getPlayRange(track);
       const sliced = await sliceAudioBuffer(track.buffer, start, end);
       const interleaved = await stretchToInterleavedStereo(sliced, tempo);
-      const blob = interleavedStereoFloatToWavBlob(interleaved, sliced.sampleRate);
-      const name = buildExportFilename(track.originalName, trackIndex, masterBpm, tempo);
+      const blob =
+        format === "mp3"
+          ? await interleavedStereoFloatToMp3Blob(interleaved, sliced.sampleRate, MP3_KBPS)
+          : interleavedStereoFloatToWavBlob(interleaved, sliced.sampleRate);
+      const name = buildExportFilename(track.originalName, trackIndex, masterBpm, tempo, format);
       downloadBlob(blob, name);
     } catch (err) {
       console.error(err);
       window.alert(
-        "書き出しに失敗しました。ネットワークで初回のみライブラリ取得が必要です。コンソールを確認してください。",
+        "書き出しに失敗しました。初回はネットワークで SoundTouch / lamejs の取得が必要です。コンソールを確認してください。",
       );
     } finally {
-      exportBtn.disabled = false;
-      exportBtn.textContent = prevLabel;
+      exportBtns.forEach((btn, i) => {
+        btn.disabled = false;
+        btn.textContent = labels[i] ?? "";
+      });
     }
   }
 
@@ -896,7 +970,8 @@ function init() {
 
     const fileIn = track.el.querySelector(".file-input");
     const estBtn = track.el.querySelector(".btn-estimate");
-    const exportBtn = track.el.querySelector(".btn-export");
+    const exportWav = track.el.querySelector(".btn-export-wav");
+    const exportMp3 = track.el.querySelector(".btn-export-mp3");
     const editEnd = track.el.querySelector(".edit-end");
     const editClear = track.el.querySelector(".btn-edit-clear");
     if (editEnd instanceof HTMLInputElement && editClear instanceof HTMLButtonElement) {
@@ -927,10 +1002,13 @@ function init() {
     if (
       !(fileIn instanceof HTMLInputElement) ||
       !(estBtn instanceof HTMLButtonElement) ||
-      !(exportBtn instanceof HTMLButtonElement)
+      !(exportWav instanceof HTMLButtonElement) ||
+      !(exportMp3 instanceof HTMLButtonElement)
     ) {
       return;
     }
+
+    const exportBtns = [exportWav, exportMp3];
 
     fileIn.addEventListener("change", async () => {
       const f = fileIn.files?.[0];
@@ -977,8 +1055,11 @@ function init() {
 
     estBtn.addEventListener("click", () => runEstimate(track));
 
-    exportBtn.addEventListener("click", () =>
-      exportPitchHoldWav(track, Number(track.el.dataset.track) || 0, exportBtn),
+    exportWav.addEventListener("click", () =>
+      exportPitchHold(track, Number(track.el.dataset.track) || 0, exportWav, exportBtns, "wav"),
+    );
+    exportMp3.addEventListener("click", () =>
+      exportPitchHold(track, Number(track.el.dataset.track) || 0, exportMp3, exportBtns, "mp3"),
     );
   });
 

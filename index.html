@@ -39,7 +39,7 @@
       <details class="details-inline">
         <summary>操作メモ・書き出し仕様</summary>
         <p class="hint hint-bpm">数値欄以外にフォーカスがあるとき <kbd>⌘/Ctrl</kbd>+<kbd>Z</kbd> で元に戻す、<kbd>Shift</kbd> 併用でやり直し。</p>
-        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。<strong>WAV</strong>は SoundTouch でピッチ保持し、画面上の「合計」倍率（基準BPM・推定BPM・速さスライダー）と同じ速さで書き出します。32bit float。初回書き出しのみ CDN でライブラリ取得。<strong>再生</strong>はミックス枠のすぐ上にあります。</p>
+        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。<strong>WAV</strong>は 32bit float、<strong>MP3</strong>は約 192kbps。どちらも SoundTouch でピッチ保持し、画面上の「合計」倍率（基準BPM・推定BPM・速さスライダー）と同じ速さで書き出します。初回書き出しのみ CDN で SoundTouch / lamejs を取得。<strong>再生</strong>はミックス枠のすぐ上にあります。</p>
       </details>
     </section>
 
@@ -72,14 +72,18 @@
             <div class="file-row">
               <input type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus,.webm,.mp4,.aiff,.aif,.caf" class="file-input" />
               <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
-              <button type="button" class="btn secondary btn-sm btn-export" title="ピッチ保持WAV（合計倍率で書き出し）">WAV</button>
+              <div class="export-bar" role="group" aria-label="ピッチ保持で書き出し（プレビューと同じ合計倍率）">
+                <span class="export-bar-label">書き出し</span>
+                <button type="button" class="btn primary btn-sm btn-export-wav" title="WAV（32bit float・高音質）">WAV</button>
+                <button type="button" class="btn secondary btn-sm btn-export-mp3" title="MP3（約192kbps・容量が小さめ）">MP3</button>
+              </div>
             </div>
             <div class="stats">
               <span>BPM <strong class="bpm-out">—</strong></span>
               <span>合計 <strong class="rate-out">1.000</strong>×</span>
             </div>
             <div class="field field-tight">
-              <label>速さ <span class="rate-mul-label">1.00</span>× <span class="rate-mul-hint">（合計に反映・WAVも同じ倍率）</span></label>
+              <label>速さ <span class="rate-mul-label">1.00</span>× <span class="rate-mul-hint">（合計に反映・書き出しも同じ倍率）</span></label>
               <input type="range" class="rate-mul" min="0.5" max="1.5" step="0.01" value="1" aria-label="トラック1 速さ倍率" />
             </div>
             <div class="field field-tight">
@@ -107,14 +111,18 @@
             <div class="file-row">
               <input type="file" accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus,.webm,.mp4,.aiff,.aif,.caf" class="file-input" />
               <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
-              <button type="button" class="btn secondary btn-sm btn-export" title="ピッチ保持WAV（合計倍率で書き出し）">WAV</button>
+              <div class="export-bar" role="group" aria-label="ピッチ保持で書き出し（プレビューと同じ合計倍率）">
+                <span class="export-bar-label">書き出し</span>
+                <button type="button" class="btn primary btn-sm btn-export-wav" title="WAV（32bit float・高音質）">WAV</button>
+                <button type="button" class="btn secondary btn-sm btn-export-mp3" title="MP3（約192kbps・容量が小さめ）">MP3</button>
+              </div>
             </div>
             <div class="stats">
               <span>BPM <strong class="bpm-out">—</strong></span>
               <span>合計 <strong class="rate-out">1.000</strong>×</span>
             </div>
             <div class="field field-tight">
-              <label>速さ <span class="rate-mul-label">1.00</span>× <span class="rate-mul-hint">（合計に反映・WAVも同じ倍率）</span></label>
+              <label>速さ <span class="rate-mul-label">1.00</span>× <span class="rate-mul-hint">（合計に反映・書き出しも同じ倍率）</span></label>
               <input type="range" class="rate-mul" min="0.5" max="1.5" step="0.01" value="1" aria-label="トラック2 速さ倍率" />
             </div>
             <div class="field field-tight">
@@ -137,7 +145,7 @@
   </main>
 
   <footer class="footer">
-    <small>音声は送信されません。書き出し時のみ CDN 取得。</small>
+    <small>音声は送信されません。書き出し時のみ CDN でライブラリ取得（SoundTouch・MP3用 lamejs）。</small>
   </footer>
 
   <script type="module" src="app.js"></script>
