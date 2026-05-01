@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Auto Mix — 波形とBPMで速度合わせ</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>Auto Mix</h1>
+    <p class="tagline">波形を読み取り、推定BPMに合わせて再生速度を自動調整し2トラックをミックスします。</p>
+  </header>
+
+  <main class="layout">
+    <section class="panel panel-master">
+      <h2>マスター</h2>
+      <div class="field" data-bpm-panel>
+        <label for="masterBpm">基準BPM（両トラックをこのテンポに揃えます）</label>
+        <div class="row row-bpm-slider">
+          <input type="range" id="masterBpmSlider" class="bpm-slider" min="40" max="240" step="0.1" value="120" aria-label="基準BPM（スライダー）" />
+          <span class="bpm-slider-label" id="masterBpmSliderLabel" aria-hidden="true">120</span>
+        </div>
+        <div class="row row-bpm-row">
+          <input type="number" id="masterBpm" min="40" max="240" step="0.1" value="120" />
+          <button type="button" id="btnBpmUndo" class="btn secondary" disabled>元に戻す</button>
+          <button type="button" id="btnBpmRedo" class="btn secondary" disabled>やり直し</button>
+          <button type="button" id="btnBpmReset" class="btn secondary">初期値へ戻す</button>
+        </div>
+        <div class="row">
+          <button type="button" id="btnSyncTrack1" class="btn secondary">トラック1の推定値を使う</button>
+          <button type="button" id="btnSyncTrack2" class="btn secondary">トラック2の推定値を使う</button>
+        </div>
+        <p class="hint hint-bpm">数値欄以外にフォーカスがあるとき <kbd>⌘/Ctrl</kbd>+<kbd>Z</kbd> で元に戻す、<kbd>Shift</kbd> 併用でやり直し。数値欄を編集中はブラウザの入力取り消しが優先されます。</p>
+      </div>
+      <div class="field">
+        <label>再生</label>
+        <div class="row">
+          <button type="button" id="btnPlay" class="btn primary">再生</button>
+          <button type="button" id="btnStop" class="btn secondary">停止</button>
+        </div>
+        <p class="hint">プレビュー再生は軽量の <code>playbackRate</code>（音程も変化）。書き出しは SoundTouch で<strong>ピッチ保持</strong>し、32bit float WAV（非圧縮）で保存します。初回書き出し時のみライブラリをCDNから読み込みます。</p>
+      </div>
+    </section>
+
+    <section class="panel panel-stems">
+      <h2>音源分離（ドラム・ベース・ボーカルなど）について</h2>
+      <p class="stems-lead">
+        1本のミックスから楽器ごとに「きれいに抜く」処理は、機械学習モデル（Demucs など）で行うのが主流です。モデルと計算資源が大きく、<strong>このページのようなブラウザだけで完結</strong>させるのは現状ほぼ不可能に近いです（WASM＋巨大モデルでも数分の曲で数GB級メモリ・長時間待ちになりがちです）。
+      </p>
+      <p class="stems-lead">
+        現実的な選択肢は、<strong>PC用アプリ</strong>（例: Ultimate Vocal Remover + Demucs）、<strong>DAWの分離プラグイン</strong>、または<strong>サーバーAPI</strong>にアップロードする形です。ローカル完結を優先するなら Demucs を自分のマシンで動かすのがバランスが良いです。
+      </p>
+      <p class="stems-links">
+        <a href="https://github.com/facebookresearch/demucs" target="_blank" rel="noopener noreferrer">Demucs（Meta・オープンソース）</a>
+        ·
+        <a href="https://github.com/Anjok07/ultimatevocalremovergui" target="_blank" rel="noopener noreferrer">Ultimate Vocal Remover</a>
+      </p>
+    </section>
+
+    <div class="tracks">
+      <article class="panel track" data-track="0">
+        <h2>トラック 1</h2>
+        <div class="file-row">
+          <input type="file" accept="audio/*" class="file-input" />
+          <button type="button" class="btn secondary btn-estimate">BPM推定</button>
+          <button type="button" class="btn secondary btn-export">ピッチ保持でWAV書き出し</button>
+        </div>
+        <div class="stats">
+          <span>推定BPM: <strong class="bpm-out">—</strong></span>
+          <span>再生レート: <strong class="rate-out">1.000</strong>×</span>
+        </div>
+        <div class="field">
+          <label>音量</label>
+          <input type="range" class="gain" min="0" max="1" step="0.01" value="0.7" />
+        </div>
+        <div class="field edit-field">
+          <label>編集（再生・書き出しの終わり）</label>
+          <p class="hint edit-hint">
+            波形で左端からの<strong>開始位置</strong>を決めたうえで、ここで<strong>終了（秒）</strong>を指定するとその範囲だけミックス再生・WAV書き出しされます。空欄はファイル末尾まで。
+          </p>
+          <div class="row edit-row">
+            <label class="edit-end-label">終了（秒）</label>
+            <input type="number" class="edit-end" step="0.01" min="0" placeholder="末尾まで" aria-label="トラック1 書き出し終了秒" />
+            <button type="button" class="btn secondary btn-edit-clear">末尾まで</button>
+          </div>
+          <p class="edit-meta">全体 <span class="dur-total">—</span> · 範囲 <span class="dur-range">—</span></p>
+        </div>
+        <canvas class="wave" width="800" height="120" aria-label="トラック1の波形"></canvas>
+      </article>
+
+      <article class="panel track" data-track="1">
+        <h2>トラック 2</h2>
+        <div class="file-row">
+          <input type="file" accept="audio/*" class="file-input" />
+          <button type="button" class="btn secondary btn-estimate">BPM推定</button>
+          <button type="button" class="btn secondary btn-export">ピッチ保持でWAV書き出し</button>
+        </div>
+        <div class="stats">
+          <span>推定BPM: <strong class="bpm-out">—</strong></span>
+          <span>再生レート: <strong class="rate-out">1.000</strong>×</span>
+        </div>
+        <div class="field">
+          <label>音量</label>
+          <input type="range" class="gain" min="0" max="1" step="0.01" value="0.7" />
+        </div>
+        <div class="field edit-field">
+          <label>編集（再生・書き出しの終わり）</label>
+          <p class="hint edit-hint">
+            波形で左端からの<strong>開始位置</strong>を決めたうえで、ここで<strong>終了（秒）</strong>を指定するとその範囲だけミックス再生・WAV書き出しされます。空欄はファイル末尾まで。
+          </p>
+          <div class="row edit-row">
+            <label class="edit-end-label">終了（秒）</label>
+            <input type="number" class="edit-end" step="0.01" min="0" placeholder="末尾まで" aria-label="トラック2 書き出し終了秒" />
+            <button type="button" class="btn secondary btn-edit-clear">末尾まで</button>
+          </div>
+          <p class="edit-meta">全体 <span class="dur-total">—</span> · 範囲 <span class="dur-range">—</span></p>
+        </div>
+        <canvas class="wave" width="800" height="120" aria-label="トラック2の波形"></canvas>
+      </article>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <small>音声ファイルはサーバーに送られません。書き出し時は処理用ライブラリをCDNから取得します。</small>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
