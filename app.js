@@ -110,20 +110,28 @@ function prefetchSoundTouchForExport() {
 const MAX_EXPORT_INTERLEAVED_SAMPLES = 96_000_000;
 
 /**
- * 入力長と tempo から、想定される最大 PCM int16 数（異常ループの早期打ち切り）
+ * SoundTouch の SimpleFilter は、ソース読み取り完了後も extract が 0 を返さず出力し続けることがある。
+ * そのため「入力終端 + 理論上の出力長 + 短いアルゴリズム用しっぽ」で打ち切る。
  * @param {AudioBuffer} inputBuffer
  * @param {number} tempo
  */
-function maxReasonablePcmInt16Samples(inputBuffer, tempo) {
+function exportPcmLengthCaps(inputBuffer, tempo) {
   const sr = inputBuffer.sampleRate;
   const inFrames = inputBuffer.length;
   if (!Number.isFinite(sr) || sr <= 0 || !Number.isFinite(inFrames) || inFrames <= 0) {
     throw new Error("オーディオの長さまたはサンプルレートが不正です。ファイルを読み直してください。");
   }
   const t = Math.max(Math.min(tempo, 16), 0.05);
-  const maxOutFrames = Math.ceil((inFrames / t) * 4 + sr * 60);
-  const wallCap = Math.floor(90 * 60 * sr * 2);
-  return Math.min(MAX_EXPORT_INTERLEAVED_SAMPLES, maxOutFrames * 2, wallCap);
+  const durSec = inFrames / sr;
+  const tailSec = Math.min(3, Math.max(0.35, durSec * 0.01));
+  const tailFrames = Math.ceil(sr * tailSec);
+  const maxOutFrames = Math.ceil(inFrames / t) + tailFrames;
+  const targetPcmInt16 = maxOutFrames * 2;
+  const runawayPcmInt16 = Math.min(
+    MAX_EXPORT_INTERLEAVED_SAMPLES,
+    Math.max(targetPcmInt16 * 4, inFrames * 8 + sr * 120 * 2),
+  );
+  return { inFrames, targetPcmInt16, runawayPcmInt16 };
 }
 
 /**
@@ -339,7 +347,7 @@ async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
     throw new Error("オーディオの長さが不正です。別の形式で書き出すか、ファイルを読み直してください。");
   }
 
-  const maxPcm = maxReasonablePcmInt16Samples(inputBuffer, tempo);
+  const { inFrames, targetPcmInt16, runawayPcmInt16 } = exportPcmLengthCaps(inputBuffer, tempo);
 
   const st = new SoundTouch();
   st.stretch.setParameters(inputBuffer.sampleRate, 0, 0, 8);
@@ -349,13 +357,14 @@ async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
 
   const source = new WebAudioBufferSource(inputBuffer);
   const filter = new SimpleFilter(source, st);
+  const filt = /** @type {{ sourcePosition: number }} */ (/** @type {unknown} */ (filter));
 
   const chunkFrames = 4096;
   const chunk = new Float32Array(chunkFrames * 2);
   let numPcmInt16Samples = 0;
   let cycles = 0;
   let iter = 0;
-  const maxIter = Math.min(2_000_000, Math.ceil(maxPcm / 512) + 100_000);
+  const maxIter = Math.min(2_000_000, Math.ceil(targetPcmInt16 / 1024) + 100_000);
 
   while (true) {
     iter += 1;
@@ -365,12 +374,24 @@ async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
       );
     }
     const n = filter.extract(chunk, chunkFrames);
-    if (n <= 0) break;
-    const need = n * 2;
-    if (numPcmInt16Samples + need > maxPcm) {
+    if (n <= 0) {
+      if (filt.sourcePosition >= inFrames) break;
+      continue;
+    }
+    let need = n * 2;
+    if (numPcmInt16Samples + need > runawayPcmInt16) {
       throw new Error(
-        "書き出し結果が想定上限を超えました。終了秒で範囲を狭げるか、速さ（テンポ）を調整してください。",
+        "書き出し結果が異常に大きくなりました。終了秒で範囲を狭げるか、速さ（テンポ）を調整して再試行してください。",
       );
+    }
+    const srcDone = filt.sourcePosition >= inFrames;
+    if (srcDone) {
+      const room = targetPcmInt16 - numPcmInt16Samples;
+      if (room <= 0) break;
+      if (need > room) {
+        need = room - (room % 2);
+        if (need <= 0) break;
+      }
     }
     const i16 = new Int16Array(need);
     for (let i = 0; i < need; i++) {
@@ -383,6 +404,7 @@ async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
     await onChunk(u8);
     cycles += 1;
     if (cycles % 8 === 0) await new Promise((r) => setTimeout(r, 0));
+    if (srcDone && numPcmInt16Samples >= targetPcmInt16) break;
   }
 
   return { numPcmInt16Samples, sampleRate: inputBuffer.sampleRate };
