@@ -1,6 +1,6 @@
 /**
  * 波形描画・簡易BPM推定・基準BPMに合わせた playbackRate ミックス
- * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ → 32bit float WAV
+ * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ（プレビューと同じ合計倍率）→ 32bit float WAV
  */
 
 const HOP = 512;
@@ -123,14 +123,23 @@ async function stretchToInterleavedStereo(inputBuffer, tempo) {
   return concatFloat32Parts(parts);
 }
 
-/** @param {string | null} originalName @param {number} trackIndex @param {number} masterBpm */
-function buildExportFilename(originalName, trackIndex, masterBpm) {
+/**
+ * @param {string | null} originalName
+ * @param {number} trackIndex
+ * @param {number} masterBpm
+ * @param {number} [totalRate] プレビューと同じ合計倍率（ファイル名に含める）
+ */
+function buildExportFilename(originalName, trackIndex, masterBpm, totalRate) {
   const raw = originalName || `track${trackIndex + 1}`;
   const base = raw
     .replace(/[/\\?%*:|"<>]/g, "_")
     .replace(/\.[^/.\\]+$/i, "");
   const mb = Number.isInteger(masterBpm) ? String(masterBpm) : String(Math.round(masterBpm * 10) / 10);
-  return `${base}_master${mb}bpm_pitchhold_IEEE.wav`;
+  const rateTag =
+    totalRate != null && Number.isFinite(totalRate)
+      ? `_total${String(Math.round(totalRate * 1000) / 1000).replace(".", "p")}x`
+      : "";
+  return `${base}_master${mb}bpm${rateTag}_pitchhold_IEEE.wav`;
 }
 
 /** @type {AudioContext | null} */
@@ -354,6 +363,15 @@ function effectivePlaybackRate(track, masterInput) {
   const mul = track.rateMul ?? 1;
   const m = Number.isFinite(mul) && mul > 0 ? mul : 1;
   return base * m;
+}
+
+/** スライダー値を TrackState に反映（書き出し直前など） */
+function syncRateMulFromUi(track) {
+  const rateMulEl = track.el.querySelector(".rate-mul");
+  if (rateMulEl instanceof HTMLInputElement) {
+    const v = parseFloat(rateMulEl.value);
+    track.rateMul = Number.isFinite(v) && v > 0 ? v : 1;
+  }
 }
 
 /** @param {TrackState} track @param {HTMLInputElement} masterInput */
@@ -805,14 +823,16 @@ function init() {
       window.alert("先にオーディオファイルを読み込んでください。");
       return;
     }
+    syncRateMulFromUi(track);
+    refreshTrackRateDisplay(track, masterBpmInput);
+
     const master = parseFloat(masterBpmInput.value);
     const masterBpm = Number.isFinite(master) && master > 0 ? master : 120;
     const b = track.estimatedBpm;
-    let tempo = b && b > 0 ? masterBpm / b : 1;
-    tempo *= track.rateMul ?? 1;
+    const tempo = effectivePlaybackRate(track, masterBpmInput);
     if (!(b && b > 0)) {
       const ok = window.confirm(
-        "推定BPMがありません。テンポ倍率 1.0（原曲の速さ）で書き出します。よろしいですか？",
+        "推定BPMがありません。基準BPMとの比率は 1.0 とみなし、画面上の「合計」倍率（速さスライダー含む）どおりにピッチ保持で書き出します。よろしいですか？",
       );
       if (!ok) return;
     }
@@ -825,7 +845,7 @@ function init() {
       const sliced = await sliceAudioBuffer(track.buffer, start, end);
       const interleaved = await stretchToInterleavedStereo(sliced, tempo);
       const blob = interleavedStereoFloatToWavBlob(interleaved, sliced.sampleRate);
-      const name = buildExportFilename(track.originalName, trackIndex, masterBpm);
+      const name = buildExportFilename(track.originalName, trackIndex, masterBpm, tempo);
       downloadBlob(blob, name);
     } catch (err) {
       console.error(err);
