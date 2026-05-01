@@ -201,6 +201,7 @@ function estimateBpmFromMono(mono, sampleRate) {
   const maxBpm = 195;
   const minLag = Math.max(2, Math.floor((60 / maxBpm) * frameRate));
   const maxLag = Math.min(diff.length - 2, Math.ceil((60 / minBpm) * frameRate));
+  if (minLag > maxLag) return null;
 
   let bestLag = minLag;
   let bestScore = -Infinity;
@@ -782,8 +783,23 @@ function init() {
 
   async function decodeFile(track, file) {
     const ctx = getContext();
+    if (ctx.state === "suspended") await ctx.resume();
     const ab = await file.arrayBuffer();
-    const buffer = await ctx.decodeAudioData(ab.slice(0));
+    const copy = ab.slice(0);
+    let buffer;
+    try {
+      buffer = await ctx.decodeAudioData(copy);
+    } catch (err) {
+      const name = file.name || "ファイル";
+      const hint =
+        "このブラウザが対応していない形式の可能性があります。MP3 / WAV（PCM）に変換するか、別のブラウザでお試しください。";
+      const wrapped = new Error(`${name} の読み込みに失敗しました。${hint}`);
+      wrapped.cause = err;
+      throw wrapped;
+    }
+    if (!buffer || buffer.length === 0) {
+      throw new Error("デコード結果が空です。別のファイルでお試しください。");
+    }
     track.buffer = buffer;
     track.originalName = file.name;
     track.startOffsetSec = 0;
@@ -802,6 +818,9 @@ function init() {
       const idx = Number(track.el.dataset.track) || 0;
       drawWaveform(canvas, buffer, colors[idx] ?? "#6c9eff", track.startOffsetSec, track.editEndSec);
     }
+    track.estimatedBpm = null;
+    setBpmDisplay(track, "—");
+    refreshTrackRateDisplay(track, masterBpmInput);
   }
 
   async function runEstimate(track) {
@@ -918,11 +937,13 @@ function init() {
       if (!f) return;
       try {
         await decodeFile(track, f);
-        await runEstimate(track);
       } catch (e) {
         console.error(e);
-        setBpmDisplay(track, "読込失敗");
+        const msg = e instanceof Error ? e.message : String(e);
+        window.alert(msg);
+        setBpmDisplay(track, "—");
         track.buffer = null;
+        track.estimatedBpm = null;
         track.originalName = null;
         track.startOffsetSec = 0;
         track.editEndSec = null;
@@ -940,6 +961,17 @@ function init() {
           const ci = Number(track.el.dataset.track) || 0;
           drawWaveform(canvas, null, colors[ci] ?? "#6c9eff");
         }
+        updateRatesFromMaster(tracks, masterBpmInput);
+        fileIn.value = "";
+        return;
+      }
+      try {
+        await runEstimate(track);
+      } catch (e) {
+        console.error("BPM推定エラー（波形は読み込み済み）", e);
+        setBpmDisplay(track, "—");
+        track.estimatedBpm = null;
+        updateRatesFromMaster(tracks, masterBpmInput);
       }
     });
 
