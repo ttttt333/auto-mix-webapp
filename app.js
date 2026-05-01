@@ -106,8 +106,25 @@ function prefetchSoundTouchForExport() {
   void loadSoundTouchModule().catch(() => {});
 }
 
-/** 書き出しのインターリーブ長（L/R 合算サンプル数）の安全上限 — メモリ対策 */
+/** 書き出しのインターリーブ長（int16 要素数）の絶対上限 — 異常検知用 */
 const MAX_EXPORT_INTERLEAVED_SAMPLES = 96_000_000;
+
+/**
+ * 入力長と tempo から、想定される最大 PCM int16 数（異常ループの早期打ち切り）
+ * @param {AudioBuffer} inputBuffer
+ * @param {number} tempo
+ */
+function maxReasonablePcmInt16Samples(inputBuffer, tempo) {
+  const sr = inputBuffer.sampleRate;
+  const inFrames = inputBuffer.length;
+  if (!Number.isFinite(sr) || sr <= 0 || !Number.isFinite(inFrames) || inFrames <= 0) {
+    throw new Error("オーディオの長さまたはサンプルレートが不正です。ファイルを読み直してください。");
+  }
+  const t = Math.max(Math.min(tempo, 16), 0.05);
+  const maxOutFrames = Math.ceil((inFrames / t) * 4 + sr * 60);
+  const wallCap = Math.floor(90 * 60 * sr * 2);
+  return Math.min(MAX_EXPORT_INTERLEAVED_SAMPLES, maxOutFrames * 2, wallCap);
+}
 
 /**
  * 大量の Uint8Array を一度に Blob にせず、ツリー状にまとめる（引数個数制限・メモリの両対策）
@@ -318,15 +335,11 @@ async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
     throw new Error("SoundTouch モジュールの形式が想定と異なります");
   }
   const dur = inputBuffer.duration;
-  const sr = inputBuffer.sampleRate;
-  const t = Math.max(tempo, 0.05);
-  const estSamples = Math.ceil((dur / t) * sr * 2 * 1.2) + 65536;
-  if (estSamples > MAX_EXPORT_INTERLEAVED_SAMPLES) {
-    const approxMin = estSamples / 2 / sr / 60;
-    throw new Error(
-      `書き出しが長すぎます（推定 約${approxMin.toFixed(1)} 分の音声）。終了秒で範囲を狭めるか、速さを上げてください。`,
-    );
+  if (!Number.isFinite(dur) || dur <= 0 || dur > 24 * 3600) {
+    throw new Error("オーディオの長さが不正です。別の形式で書き出すか、ファイルを読み直してください。");
   }
+
+  const maxPcm = maxReasonablePcmInt16Samples(inputBuffer, tempo);
 
   const st = new SoundTouch();
   st.stretch.setParameters(inputBuffer.sampleRate, 0, 0, 8);
@@ -341,11 +354,24 @@ async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
   const chunk = new Float32Array(chunkFrames * 2);
   let numPcmInt16Samples = 0;
   let cycles = 0;
+  let iter = 0;
+  const maxIter = Math.min(2_000_000, Math.ceil(maxPcm / 512) + 100_000);
 
   while (true) {
+    iter += 1;
+    if (iter > maxIter) {
+      throw new Error(
+        "書き出しが想定より長引きました。終了秒で範囲を狭げるか、基準BPM・速さを確認してください。",
+      );
+    }
     const n = filter.extract(chunk, chunkFrames);
     if (n <= 0) break;
     const need = n * 2;
+    if (numPcmInt16Samples + need > maxPcm) {
+      throw new Error(
+        "書き出し結果が想定上限を超えました。終了秒で範囲を狭げるか、速さ（テンポ）を調整してください。",
+      );
+    }
     const i16 = new Int16Array(need);
     for (let i = 0; i < need; i++) {
       const x = chunk[i];
@@ -354,15 +380,23 @@ async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
     }
     const u8 = new Uint8Array(i16.buffer, i16.byteOffset, i16.byteLength);
     numPcmInt16Samples += need;
-    if (numPcmInt16Samples > MAX_EXPORT_INTERLEAVED_SAMPLES) {
-      throw new Error("書き出し結果が大きすぎます。終了秒で範囲を狭めてください。");
-    }
     await onChunk(u8);
     cycles += 1;
     if (cycles % 8 === 0) await new Promise((r) => setTimeout(r, 0));
   }
 
   return { numPcmInt16Samples, sampleRate: inputBuffer.sampleRate };
+}
+
+/**
+ * 保存ダイアログ用に .wav を付ける（拡張子なしだと環境によって MIME がずれることがある）
+ * @param {string} name
+ */
+function ensureWavFilename(name) {
+  const t = name.trim() || "export.wav";
+  if (/\.wav$/i.test(t)) return t;
+  const base = t.replace(/\.[^/.\\]+$/i, "");
+  return `${base || "export"}.wav`;
 }
 
 /**
@@ -376,8 +410,9 @@ async function streamWavToDiskWithSoundTouch(sliced, tempo, suggestedName) {
   if (typeof w.showSaveFilePicker !== "function") {
     throw new Error("showSaveFilePicker 非対応");
   }
+  const safeName = ensureWavFilename(suggestedName);
   const handle = await w.showSaveFilePicker({
-    suggestedName,
+    suggestedName: safeName,
     types: [
       {
         description: "WAV",
@@ -385,22 +420,36 @@ async function streamWavToDiskWithSoundTouch(sliced, tempo, suggestedName) {
       },
     ],
   });
-  const writable = await handle.createWritable();
-  await writable.write(new Uint8Array(44));
-  let pcmBytes = 0;
-  const sr = sliced.sampleRate;
-  await forEachSoundTouchPcmChunk(sliced, tempo, async (u8) => {
-    await writable.write(u8);
-    pcmBytes += u8.length;
-  });
-  const hdr = buildWavHeaderBytes(pcmBytes, sr);
-  if (typeof writable.seek === "function") {
-    await writable.seek(0);
-  } else {
-    throw new Error("ファイル先頭へのシークができません。通常の書き出しにフォールバックしてください。");
+  /** @type {FileSystemWritableFileStream | null} */
+  let writable = null;
+  try {
+    writable = await handle.createWritable();
+    await writable.write(new Uint8Array(44));
+    let pcmBytes = 0;
+    const sr = sliced.sampleRate;
+    await forEachSoundTouchPcmChunk(sliced, tempo, async (u8) => {
+      await writable.write(u8);
+      pcmBytes += u8.length;
+    });
+    const hdr = buildWavHeaderBytes(pcmBytes, sr);
+    if (typeof writable.seek === "function") {
+      await writable.seek(0);
+    } else {
+      throw new Error("ファイル先頭へのシークができません。通常の書き出しにフォールバックしてください。");
+    }
+    await writable.write(hdr);
+    await writable.close();
+    writable = null;
+  } catch (e) {
+    if (writable) {
+      try {
+        await writable.abort();
+      } catch {
+        /* ignore */
+      }
+    }
+    throw e;
   }
-  await writable.write(hdr);
-  await writable.close();
 }
 
 async function soundTouchStretchToPcm16Parts(inputBuffer, tempo) {
