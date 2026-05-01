@@ -10,13 +10,20 @@ const FRAME = 2048;
 /** MP3 ビットレート（固定） */
 const MP3_KBPS = 192;
 
-/** ピッチ保持（SoundTouch）・MP3（lamejs）は複数 CDN を順に試す */
+/** ピッチ保持（SoundTouch）は import、MP3（lamejs）は公式 IIFE の lame.min.js を優先（ESM 束縛だと Encoder が欠ける） */
 const SOUNDTOUCH_IMPORT_URLS = [
   "https://cdn.jsdelivr.net/npm/@soundtouchjs/core@1.0.10/dist/index.js",
   "https://esm.sh/@soundtouchjs/core@1.0.10",
   "https://unpkg.com/@soundtouchjs/core@1.0.10/dist/index.js",
 ];
 
+/** lame.min.js（IIFE）。+esm 等の束縛では `Encoder.SHORT_TYPE` 参照が壊れることがある */
+const LAMEJS_SCRIPT_URLS = [
+  "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js",
+  "https://unpkg.com/lamejs@1.2.1/lame.min.js",
+];
+
+/** 上記が失敗したときのみ試す（非推奨・デバッグ用） */
 const LAMEJS_IMPORT_URLS = [
   "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/+esm",
   "https://esm.sh/lamejs@1.2.1",
@@ -27,6 +34,9 @@ let soundTouchModuleCache = null;
 
 /** @type {unknown} */
 let lameJsModuleCache = null;
+
+/** @type {Promise<void> | null} */
+let lameJsScriptLoadPromise = null;
 
 /**
  * @param {unknown} mod
@@ -54,6 +64,51 @@ function lameModuleLooksUsable(mod) {
       ? /** @type {{ Mp3Encoder: unknown }} */ (o).Mp3Encoder
       : null;
   return typeof pick(d) === "function" || typeof pick(mod) === "function";
+}
+
+/**
+ * 公式ビルド lame.min.js で `globalThis.lamejs.Mp3Encoder` を定義する（ESM より安定）。
+ * @returns {Promise<void>}
+ */
+function ensureLameGlobalFromScript() {
+  const root = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : null;
+  const lj0 = root && /** @type {{ lamejs?: { Mp3Encoder?: unknown } }} */ (root).lamejs;
+  if (lj0 && typeof lj0.Mp3Encoder === "function") {
+    return Promise.resolve();
+  }
+  if (lameJsScriptLoadPromise) return lameJsScriptLoadPromise;
+
+  lameJsScriptLoadPromise = (async () => {
+    if (typeof document === "undefined" || !document.createElement) {
+      lameJsScriptLoadPromise = null;
+      throw new Error("document 非対応");
+    }
+    const messages = [];
+    for (const url of LAMEJS_SCRIPT_URLS) {
+      try {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.async = true;
+          s.src = url;
+          s.onload = () => resolve(undefined);
+          s.onerror = () => reject(new Error("読み込み失敗"));
+          (document.head || document.documentElement).appendChild(s);
+        });
+        const lj = root && /** @type {{ lamejs?: { Mp3Encoder?: unknown } }} */ (root).lamejs;
+        if (lj && typeof lj.Mp3Encoder === "function") {
+          return;
+        }
+        messages.push(`${url} → lamejs.Mp3Encoder が未定義`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        messages.push(`${url} → ${msg}`);
+      }
+    }
+    lameJsScriptLoadPromise = null;
+    throw new Error(messages.join("\n"));
+  })();
+
+  return lameJsScriptLoadPromise;
 }
 
 async function loadSoundTouchModule() {
@@ -86,6 +141,21 @@ async function loadLameJsModule() {
   }
   lameJsModuleCache = null;
   const errors = [];
+
+  try {
+    await ensureLameGlobalFromScript();
+    const root = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : null;
+    const lj = /** @type {{ lamejs?: { Mp3Encoder?: unknown } }} */ (root).lamejs;
+    if (lj && typeof lj.Mp3Encoder === "function") {
+      lameJsModuleCache = { Mp3Encoder: lj.Mp3Encoder };
+      return lameJsModuleCache;
+    }
+    errors.push("lame.min.js → Mp3Encoder が見つかりません");
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    errors.push(`lame.min.js → ${msg}`);
+  }
+
   for (const url of LAMEJS_IMPORT_URLS) {
     try {
       const mod = await import(/* @vite-ignore */ /* webpackIgnore: true */ url);
