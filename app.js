@@ -110,18 +110,43 @@ function prefetchSoundTouchForExport() {
 const MAX_EXPORT_INTERLEAVED_SAMPLES = 96_000_000;
 
 /**
- * インターリーブ stereo float32 → 16bit PCM WAV（メモリ節約・互換性重視）
- * @param {Float32Array} interleavedStereo length は偶数
+ * 大量の Uint8Array を一度に Blob にせず、ツリー状にまとめる（引数個数制限・メモリの両対策）
+ * @param {Uint8Array[]} parts
+ */
+function nestBlobParts(parts) {
+  const batchSize = 256;
+  if (parts.length === 0) return new Blob([]);
+  /** @type {BlobPart[]} */
+  let level = parts.map((p) => /** @type {BlobPart} */ (p));
+  while (level.length > batchSize) {
+    /** @type {BlobPart[]} */
+    const next = [];
+    for (let i = 0; i < level.length; i += batchSize) {
+      next.push(new Blob(level.slice(i, i + batchSize)));
+    }
+    level = next;
+  }
+  return new Blob(level);
+}
+
+/**
+ * 16bit PCM チャンクから WAV（単一の巨大 ArrayBuffer を作らない）
+ * @param {Uint8Array[]} pcmParts little-endian int16 ステレオインターリーブの連続バイト列の断片
+ * @param {number} numPcmInt16Samples インターリーブした int16 の個数（L+R 含む、偶数）
  * @param {number} sampleRate
  */
-function interleavedStereoFloatToWavBlob(interleavedStereo, sampleRate) {
+function pcmPartsToWavBlob(pcmParts, numPcmInt16Samples, sampleRate) {
   const numChannels = 2;
   const bytesPerSample = 2;
   const blockAlign = numChannels * bytesPerSample;
-  const numSamples = interleavedStereo.length;
-  const dataBytes = numSamples * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataBytes);
-  const dv = new DataView(buffer);
+  const dataBytes = numPcmInt16Samples * bytesPerSample;
+  let sum = 0;
+  for (const p of pcmParts) sum += p.length;
+  if (sum !== dataBytes) {
+    throw new Error("内部エラー: PCM サイズが一致しません");
+  }
+  const header = new ArrayBuffer(44);
+  const dv = new DataView(header);
   let o = 0;
   const writeStr = (s) => {
     for (let i = 0; i < s.length; i++) dv.setUint8(o++, s.charCodeAt(i));
@@ -148,22 +173,21 @@ function interleavedStereoFloatToWavBlob(interleavedStereo, sampleRate) {
   writeStr("data");
   dv.setUint32(o, dataBytes, true);
   o += 4;
-  const int16 = new Int16Array(buffer, o, numSamples);
-  for (let i = 0; i < numSamples; i++) {
-    const x = interleavedStereo[i];
-    const c = Math.max(-1, Math.min(1, x));
-    int16[i] = c < 0 ? c * 0x8000 : c * 0x7fff;
-  }
-  return new Blob([buffer], { type: "audio/wav" });
+  const pcmBlob = nestBlobParts(pcmParts);
+  return new Blob([new Uint8Array(header), pcmBlob], { type: "audio/wav" });
 }
 
 /**
- * インターリーブ stereo float32 → MP3（lamejs）
- * @param {Float32Array} interleavedStereo
+ * 16bit PCM チャンクを順に読み、MP3 化（全長の Float32 を保持しない）
+ * @param {Uint8Array[]} pcmParts
+ * @param {number} numPcmInt16Samples
  * @param {number} sampleRate
  * @param {number} kbps
  */
-async function interleavedStereoFloatToMp3Blob(interleavedStereo, sampleRate, kbps) {
+async function pcmPartsToMp3Blob(pcmParts, numPcmInt16Samples, sampleRate, kbps) {
+  if (numPcmInt16Samples % 2 !== 0) {
+    throw new Error("内部エラー: ステレオサンプル数が偶数ではありません");
+  }
   const mod = await loadLameJsModule();
   const d =
     mod && typeof mod === "object" && "default" in /** @type {object} */ (mod) ? /** @type {{ default: unknown }} */ (mod).default : mod;
@@ -178,33 +202,53 @@ async function interleavedStereoFloatToMp3Blob(interleavedStereo, sampleRate, kb
   if (typeof Mp3Encoder !== "function") {
     throw new Error("lamejs の Mp3Encoder が見つかりません");
   }
-  const framesTotal = Math.floor(interleavedStereo.length / 2);
   const enc = new Mp3Encoder(2, sampleRate, kbps);
   const left = new Int16Array(1152);
   const right = new Int16Array(1152);
-  const parts = [];
-  let frameOffset = 0;
-  let cycles = 0;
-  while (frameOffset < framesTotal) {
-    const nFrames = Math.min(1152, framesTotal - frameOffset);
-    for (let i = 0; i < nFrames; i++) {
-      const j = (frameOffset + i) * 2;
-      const L = interleavedStereo[j];
-      const R = interleavedStereo[j + 1];
-      const l = Math.max(-1, Math.min(1, L));
-      const r = Math.max(-1, Math.min(1, R));
-      left[i] = l < 0 ? l * 0x8000 : l * 0x7fff;
-      right[i] = r < 0 ? r * 0x8000 : r * 0x7fff;
+  const outParts = [];
+
+  let partIdx = 0;
+  let byteOff = 0;
+
+  const readNextPair = () => {
+    while (partIdx < pcmParts.length) {
+      const p = pcmParts[partIdx];
+      if (byteOff + 4 <= p.length) {
+        const dv = new DataView(p.buffer, p.byteOffset + byteOff, 4);
+        const L = dv.getInt16(0, true);
+        const R = dv.getInt16(2, true);
+        byteOff += 4;
+        if (byteOff >= p.length) {
+          partIdx += 1;
+          byteOff = 0;
+        }
+        return { L, R };
+      }
+      partIdx += 1;
+      byteOff = 0;
     }
+    return null;
+  };
+
+  let cycles = 0;
+  while (true) {
+    let nFrames = 0;
+    while (nFrames < 1152) {
+      const pair = readNextPair();
+      if (!pair) break;
+      left[nFrames] = pair.L;
+      right[nFrames] = pair.R;
+      nFrames += 1;
+    }
+    if (nFrames === 0) break;
     const buf = enc.encodeBuffer(left.subarray(0, nFrames), right.subarray(0, nFrames));
-    if (buf && buf.length > 0) parts.push(new Uint8Array(buf));
-    frameOffset += nFrames;
+    if (buf && buf.length > 0) outParts.push(new Uint8Array(buf));
     cycles += 1;
     if (cycles % 12 === 0) await new Promise((r) => setTimeout(r, 0));
   }
   const end = enc.flush();
-  if (end && end.length > 0) parts.push(new Uint8Array(end));
-  return new Blob(parts, { type: "audio/mpeg" });
+  if (end && end.length > 0) outParts.push(new Uint8Array(end));
+  return new Blob(outParts, { type: "audio/mpeg" });
 }
 
 /** @param {Blob} blob @param {string} filename */
@@ -221,12 +265,13 @@ function downloadBlob(blob, filename) {
 }
 
 /**
- * ピッチを維持したままテンポのみ変更（SoundTouch）
- * 中間データは1本のバッファに追記し、細切れ配列の結合でメモリを倍にしない。
+ * SoundTouch でピッチ保持ストレッチし、16bit ステレオ PCM を小さなチャンクの配列で返す。
+ * 全長分の Float32Array / 巨大な単一 ArrayBuffer を確保しない（Array buffer allocation failed 対策）。
  * @param {AudioBuffer} inputBuffer
- * @param {number} tempo 1=原曲、>1 高速、<1 低速（playbackRate と同様の時間比）
+ * @param {number} tempo
+ * @returns {Promise<{ pcmParts: Uint8Array[]; numPcmInt16Samples: number; sampleRate: number }>}
  */
-async function stretchToInterleavedStereo(inputBuffer, tempo) {
+async function soundTouchStretchToPcm16Parts(inputBuffer, tempo) {
   const ST = await loadSoundTouchModule();
   const SoundTouch = ST.SoundTouch;
   const SimpleFilter = ST.SimpleFilter;
@@ -256,42 +301,31 @@ async function stretchToInterleavedStereo(inputBuffer, tempo) {
 
   const chunkFrames = 4096;
   const chunk = new Float32Array(chunkFrames * 2);
-  let out = new Float32Array(Math.min(estSamples, MAX_EXPORT_INTERLEAVED_SAMPLES));
-  let offset = 0;
+  /** @type {Uint8Array[]} */
+  const pcmParts = [];
+  let numPcmInt16Samples = 0;
   let cycles = 0;
+
   while (true) {
     const n = filter.extract(chunk, chunkFrames);
     if (n <= 0) break;
     const need = n * 2;
-    if (offset + need > out.length) {
-      const minLen = offset + need;
-      if (minLen > MAX_EXPORT_INTERLEAVED_SAMPLES) {
-        throw new Error("書き出し結果が大きすぎます。終了秒で範囲を狭めてください。");
-      }
-      let nlen = out.length;
-      while (nlen < minLen) {
-        const next = Math.min(Math.ceil(nlen * 1.5) + 65536, MAX_EXPORT_INTERLEAVED_SAMPLES);
-        if (next <= nlen) {
-          throw new Error("書き出し結果が大きすぎます。終了秒で範囲を狭めてください。");
-        }
-        nlen = next;
-      }
-      try {
-        const grown = new Float32Array(nlen);
-        grown.set(out.subarray(0, offset));
-        out = grown;
-      } catch {
-        throw new Error(
-          "メモリが足りず書き出しを完了できませんでした（Array buffer allocation failed）。終了秒で短くするか、別のブラウザ・タブを減らしてお試しください。",
-        );
-      }
+    const i16 = new Int16Array(need);
+    for (let i = 0; i < need; i++) {
+      const x = chunk[i];
+      const c = Math.max(-1, Math.min(1, x));
+      i16[i] = c < 0 ? c * 0x8000 : c * 0x7fff;
     }
-    out.set(chunk.subarray(0, need), offset);
-    offset += need;
+    pcmParts.push(new Uint8Array(i16.buffer.slice(0)));
+    numPcmInt16Samples += need;
+    if (numPcmInt16Samples > MAX_EXPORT_INTERLEAVED_SAMPLES) {
+      throw new Error("書き出し結果が大きすぎます。終了秒で範囲を狭めてください。");
+    }
     cycles += 1;
     if (cycles % 8 === 0) await new Promise((r) => setTimeout(r, 0));
   }
-  return out.subarray(0, offset);
+
+  return { pcmParts, numPcmInt16Samples, sampleRate: inputBuffer.sampleRate };
 }
 
 /**
@@ -1047,11 +1081,11 @@ function init() {
     try {
       const { start, end } = getPlayRange(track);
       const sliced = await sliceAudioBuffer(track.buffer, start, end);
-      const interleaved = await stretchToInterleavedStereo(sliced, tempo);
+      const { pcmParts, numPcmInt16Samples, sampleRate } = await soundTouchStretchToPcm16Parts(sliced, tempo);
       const blob =
         format === "mp3"
-          ? await interleavedStereoFloatToMp3Blob(interleaved, sliced.sampleRate, MP3_KBPS)
-          : interleavedStereoFloatToWavBlob(interleaved, sliced.sampleRate);
+          ? await pcmPartsToMp3Blob(pcmParts, numPcmInt16Samples, sampleRate, MP3_KBPS)
+          : pcmPartsToWavBlob(pcmParts, numPcmInt16Samples, sampleRate);
       const name = buildExportFilename(track.originalName, trackIndex, masterBpm, tempo, format);
       downloadBlob(blob, name);
     } catch (err) {
