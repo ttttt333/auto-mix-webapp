@@ -10,14 +10,14 @@
   <header class="header">
     <div class="header-inner">
       <h1>Auto Mix</h1>
-      <p class="tagline">BPM合わせ・2トラックミックス・ピッチ保持書き出し</p>
+      <p class="tagline">レイヤミックス・BPM・速さ調整</p>
     </div>
   </header>
 
   <main class="layout">
     <section class="panel panel-master panel-master-compact">
       <h2>マスター</h2>
-      <div class="master-grid">
+      <div class="master-grid master-grid-single">
         <div class="field" data-bpm-panel>
           <label for="masterBpm">基準BPM</label>
           <div class="row row-bpm-slider">
@@ -35,18 +35,11 @@
             <button type="button" id="btnSyncTrack2" class="btn secondary btn-sm">T2推定</button>
           </div>
         </div>
-        <div class="field field-play">
-          <label>再生</label>
-          <div class="row">
-            <button type="button" id="btnPlay" class="btn primary btn-sm">再生</button>
-            <button type="button" id="btnStop" class="btn secondary btn-sm">停止</button>
-          </div>
-        </div>
       </div>
       <details class="details-inline">
         <summary>操作メモ・書き出し仕様</summary>
         <p class="hint hint-bpm">数値欄以外にフォーカスがあるとき <kbd>⌘/Ctrl</kbd>+<kbd>Z</kbd> で元に戻す、<kbd>Shift</kbd> 併用でやり直し。</p>
-        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。書き出しは SoundTouch でピッチ保持・32bit float WAV。初回書き出しのみ CDN でライブラリ取得。</p>
+        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。書き出しは SoundTouch でピッチ保持・32bit float WAV。初回書き出しのみ CDN でライブラリ取得。下の<strong>再生</strong>は常に画面下にあります。</p>
       </details>
     </section>
 
@@ -62,64 +55,91 @@
       </p>
     </details>
 
-    <div class="tracks-grid">
-      <article class="panel track" data-track="0">
-        <h2>トラック 1</h2>
-        <div class="file-row">
-          <input type="file" accept="audio/*" class="file-input" />
-          <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
-          <button type="button" class="btn secondary btn-sm btn-export">WAV</button>
-        </div>
-        <div class="stats">
-          <span>BPM <strong class="bpm-out">—</strong></span>
-          <span>× <strong class="rate-out">1.000</strong></span>
-        </div>
-        <div class="field field-tight">
-          <label>音量</label>
-          <input type="range" class="gain" min="0" max="1" step="0.01" value="0.7" />
-        </div>
-        <div class="field edit-field field-tight">
-          <label>終了秒（空=末尾）</label>
-          <div class="row edit-row">
-            <input type="number" class="edit-end" step="0.01" min="0" placeholder="末尾" aria-label="トラック1 書き出し終了秒" />
-            <button type="button" class="btn secondary btn-sm btn-edit-clear">末尾</button>
+    <section class="panel mix-panel">
+      <h2>ミックス（レイヤ）</h2>
+      <p class="mix-hint">左の <span class="grip-sample">⠿</span> をドラッグして上下を入れ替え（手前／奥の表示）。音は同時再生でミックスされます。</p>
+      <div id="layerStack" class="layer-stack">
+        <article class="track layer" data-track="0">
+          <div class="layer-head" draggable="true">
+            <span class="layer-grip" aria-hidden="true">⠿</span>
+            <h2>トラック 1</h2>
           </div>
-          <p class="edit-meta">全体 <span class="dur-total">—</span> · 範囲 <span class="dur-range">—</span></p>
-        </div>
-        <canvas class="wave" width="400" height="56" aria-label="トラック1の波形"></canvas>
-      </article>
+          <div class="layer-body">
+            <div class="file-row">
+              <input type="file" accept="audio/*" class="file-input" />
+              <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
+              <button type="button" class="btn secondary btn-sm btn-export">WAV</button>
+            </div>
+            <div class="stats">
+              <span>BPM <strong class="bpm-out">—</strong></span>
+              <span>合計 <strong class="rate-out">1.000</strong>×</span>
+            </div>
+            <div class="field field-tight">
+              <label>速さ <span class="rate-mul-label">1.00</span>× <span class="rate-mul-hint">（BPMに追加）</span></label>
+              <input type="range" class="rate-mul" min="0.5" max="1.5" step="0.01" value="1" aria-label="トラック1 速さ倍率" />
+            </div>
+            <div class="field field-tight">
+              <label>音量</label>
+              <input type="range" class="gain" min="0" max="1" step="0.01" value="0.7" />
+            </div>
+            <div class="field edit-field field-tight">
+              <label>終了秒（空=末尾）</label>
+              <div class="row edit-row">
+                <input type="number" class="edit-end" step="0.01" min="0" placeholder="末尾" aria-label="トラック1 書き出し終了秒" />
+                <button type="button" class="btn secondary btn-sm btn-edit-clear">末尾</button>
+              </div>
+              <p class="edit-meta">全体 <span class="dur-total">—</span> · 範囲 <span class="dur-range">—</span></p>
+            </div>
+            <canvas class="wave" width="400" height="56" aria-label="トラック1の波形"></canvas>
+          </div>
+        </article>
 
-      <article class="panel track" data-track="1">
-        <h2>トラック 2</h2>
-        <div class="file-row">
-          <input type="file" accept="audio/*" class="file-input" />
-          <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
-          <button type="button" class="btn secondary btn-sm btn-export">WAV</button>
-        </div>
-        <div class="stats">
-          <span>BPM <strong class="bpm-out">—</strong></span>
-          <span>× <strong class="rate-out">1.000</strong></span>
-        </div>
-        <div class="field field-tight">
-          <label>音量</label>
-          <input type="range" class="gain" min="0" max="1" step="0.01" value="0.7" />
-        </div>
-        <div class="field edit-field field-tight">
-          <label>終了秒（空=末尾）</label>
-          <div class="row edit-row">
-            <input type="number" class="edit-end" step="0.01" min="0" placeholder="末尾" aria-label="トラック2 書き出し終了秒" />
-            <button type="button" class="btn secondary btn-sm btn-edit-clear">末尾</button>
+        <article class="track layer" data-track="1">
+          <div class="layer-head" draggable="true">
+            <span class="layer-grip" aria-hidden="true">⠿</span>
+            <h2>トラック 2</h2>
           </div>
-          <p class="edit-meta">全体 <span class="dur-total">—</span> · 範囲 <span class="dur-range">—</span></p>
-        </div>
-        <canvas class="wave" width="400" height="56" aria-label="トラック2の波形"></canvas>
-      </article>
-    </div>
+          <div class="layer-body">
+            <div class="file-row">
+              <input type="file" accept="audio/*" class="file-input" />
+              <button type="button" class="btn secondary btn-sm btn-estimate">BPM</button>
+              <button type="button" class="btn secondary btn-sm btn-export">WAV</button>
+            </div>
+            <div class="stats">
+              <span>BPM <strong class="bpm-out">—</strong></span>
+              <span>合計 <strong class="rate-out">1.000</strong>×</span>
+            </div>
+            <div class="field field-tight">
+              <label>速さ <span class="rate-mul-label">1.00</span>× <span class="rate-mul-hint">（BPMに追加）</span></label>
+              <input type="range" class="rate-mul" min="0.5" max="1.5" step="0.01" value="1" aria-label="トラック2 速さ倍率" />
+            </div>
+            <div class="field field-tight">
+              <label>音量</label>
+              <input type="range" class="gain" min="0" max="1" step="0.01" value="0.7" />
+            </div>
+            <div class="field edit-field field-tight">
+              <label>終了秒（空=末尾）</label>
+              <div class="row edit-row">
+                <input type="number" class="edit-end" step="0.01" min="0" placeholder="末尾" aria-label="トラック2 書き出し終了秒" />
+                <button type="button" class="btn secondary btn-sm btn-edit-clear">末尾</button>
+              </div>
+              <p class="edit-meta">全体 <span class="dur-total">—</span> · 範囲 <span class="dur-range">—</span></p>
+            </div>
+            <canvas class="wave" width="400" height="56" aria-label="トラック2の波形"></canvas>
+          </div>
+        </article>
+      </div>
+    </section>
   </main>
 
   <footer class="footer">
     <small>音声は送信されません。書き出し時のみ CDN 取得。</small>
   </footer>
+
+  <div class="play-dock" role="toolbar" aria-label="再生">
+    <button type="button" id="btnPlay" class="btn primary btn-play-main">再生</button>
+    <button type="button" id="btnStop" class="btn secondary btn-play-main">停止</button>
+  </div>
 
   <script type="module" src="app.js"></script>
 </body>

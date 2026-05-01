@@ -136,7 +136,7 @@ function buildExportFilename(originalName, trackIndex, masterBpm) {
 /** @type {AudioContext | null} */
 let audioContext = null;
 
-/** @typedef {{ buffer: AudioBuffer | null, estimatedBpm: number | null, originalName: string | null, startOffsetSec: number, editEndSec: number | null, el: HTMLElement }} TrackState */
+/** @typedef {{ buffer: AudioBuffer | null, estimatedBpm: number | null, originalName: string | null, startOffsetSec: number, editEndSec: number | null, rateMul: number, el: HTMLElement }} TrackState */
 
 /** @type {() => void} */
 let stopScrubPreviewFn = () => {};
@@ -341,10 +341,28 @@ function setBpmDisplay(track, bpmText) {
   if (bpmOut) bpmOut.textContent = bpmText;
 }
 
-/** @param {TrackState} track @param {number} rate */
-function setRateDisplay(track, rate) {
+/**
+ * 基準BPM・推定BPMに基づく倍率 × トラック「速さ」スライダー
+ * @param {TrackState} track
+ * @param {HTMLInputElement} masterInput
+ */
+function effectivePlaybackRate(track, masterInput) {
+  const master = parseFloat(masterInput.value);
+  const mbpm = Number.isFinite(master) && master > 0 ? master : 120;
+  const b = track.estimatedBpm;
+  const base = b && b > 0 ? mbpm / b : 1;
+  const mul = track.rateMul ?? 1;
+  const m = Number.isFinite(mul) && mul > 0 ? mul : 1;
+  return base * m;
+}
+
+/** @param {TrackState} track @param {HTMLInputElement} masterInput */
+function refreshTrackRateDisplay(track, masterInput) {
+  const total = effectivePlaybackRate(track, masterInput);
   const r = track.el.querySelector(".rate-out");
-  if (r) r.textContent = rate.toFixed(3);
+  if (r) r.textContent = total.toFixed(3);
+  const lab = track.el.querySelector(".rate-mul-label");
+  if (lab) lab.textContent = (track.rateMul ?? 1).toFixed(2);
 }
 
 /**
@@ -352,16 +370,11 @@ function setRateDisplay(track, rate) {
  * @param {HTMLInputElement} masterInput
  */
 function updateRatesFromMaster(tracks, masterInput) {
-  const master = parseFloat(masterInput.value);
-  const mbpm = Number.isFinite(master) && master > 0 ? master : 120;
   for (const t of tracks) {
-    const b = t.estimatedBpm;
-    const rate = b && b > 0 ? mbpm / b : 1;
-    setRateDisplay(t, rate);
+    refreshTrackRateDisplay(t, masterInput);
   }
-  for (const { src, track } of activeMix) {
-    const b = track.estimatedBpm;
-    src.playbackRate.value = b && b > 0 ? mbpm / b : 1;
+  for (const { src, track: tr } of activeMix) {
+    src.playbackRate.value = effectivePlaybackRate(tr, masterInput);
   }
 }
 
@@ -405,11 +418,6 @@ async function playMix(tracks, masterInput) {
 
   stopPlayback();
 
-  const masterBpm = (() => {
-    const v = parseFloat(masterInput.value);
-    return Number.isFinite(v) && v > 0 ? v : 120;
-  })();
-
   const masterGain = ctx.createGain();
   masterGain.gain.value = 0.85;
   masterGain.connect(ctx.destination);
@@ -418,8 +426,7 @@ async function playMix(tracks, masterInput) {
     if (!t.buffer) continue;
     const src = ctx.createBufferSource();
     src.buffer = t.buffer;
-    const b = t.estimatedBpm;
-    src.playbackRate.value = b && b > 0 ? masterBpm / b : 1;
+    src.playbackRate.value = effectivePlaybackRate(t, masterInput);
 
     const g = ctx.createGain();
     const slider = t.el.querySelector(".gain");
@@ -477,7 +484,14 @@ function init() {
     return;
   }
 
-  const panels = Array.from(document.querySelectorAll(".track"));
+  const layerStack = document.getElementById("layerStack");
+  const panels = layerStack
+    ? Array.from(layerStack.querySelectorAll(".track")).sort(
+        (a, b) => Number(a.dataset.track) - Number(b.dataset.track),
+      )
+    : Array.from(document.querySelectorAll(".track")).sort(
+        (a, b) => Number(a.dataset.track) - Number(b.dataset.track),
+      );
   /** @type {TrackState[]} */
   const tracks = panels.map((el) => ({
     buffer: null,
@@ -485,6 +499,7 @@ function init() {
     originalName: null,
     startOffsetSec: 0,
     editEndSec: null,
+    rateMul: 1,
     el,
   }));
 
@@ -582,7 +597,8 @@ function init() {
   syncSliderAndLabelFromInput();
   updateUndoRedoButtons();
 
-  function redrawTrackWave(track, idx) {
+  function redrawTrackWave(track) {
+    const idx = Number(track.el.dataset.track) || 0;
     const canvas = track.el.querySelector(".wave");
     if (!(canvas instanceof HTMLCanvasElement)) return;
     drawWaveform(
@@ -657,10 +673,7 @@ function init() {
     const playDur = Math.max(0.01, end - clamped);
     const src = ctx.createBufferSource();
     src.buffer = buf;
-    const b = track.estimatedBpm;
-    const master = parseFloat(masterBpmInput.value);
-    const mbpm = Number.isFinite(master) && master > 0 ? master : 120;
-    src.playbackRate.value = b && b > 0 ? mbpm / b : 1;
+    src.playbackRate.value = effectivePlaybackRate(track, masterBpmInput);
     const g = ctx.createGain();
     g.gain.value = 0.75;
     src.connect(g);
@@ -672,9 +685,8 @@ function init() {
 
   /**
    * @param {TrackState} track
-   * @param {number} trackIndex
    */
-  function attachWavePointerHandlers(track, trackIndex) {
+  function attachWavePointerHandlers(track) {
     const canvas = track.el.querySelector(".wave");
     if (!(canvas instanceof HTMLCanvasElement)) return;
 
@@ -697,7 +709,7 @@ function init() {
           : bufDur;
       t = Math.min(t, Math.max(0, endBound - 0.01));
       track.startOffsetSec = Math.max(0, t);
-      redrawTrackWave(track, trackIndex);
+      redrawTrackWave(track);
       refreshEditMeta(track);
     };
 
@@ -758,6 +770,9 @@ function init() {
     track.originalName = file.name;
     track.startOffsetSec = 0;
     track.editEndSec = null;
+    track.rateMul = 1;
+    const rateMulInp = track.el.querySelector(".rate-mul");
+    if (rateMulInp instanceof HTMLInputElement) rateMulInp.value = "1";
     const editInp = track.el.querySelector(".edit-end");
     if (editInp instanceof HTMLInputElement) {
       editInp.value = "";
@@ -766,7 +781,7 @@ function init() {
     refreshEditMeta(track);
     const canvas = track.el.querySelector(".wave");
     if (canvas instanceof HTMLCanvasElement) {
-      const idx = tracks.indexOf(track);
+      const idx = Number(track.el.dataset.track) || 0;
       drawWaveform(canvas, buffer, colors[idx] ?? "#6c9eff", track.startOffsetSec, track.editEndSec);
     }
   }
@@ -793,7 +808,8 @@ function init() {
     const master = parseFloat(masterBpmInput.value);
     const masterBpm = Number.isFinite(master) && master > 0 ? master : 120;
     const b = track.estimatedBpm;
-    const tempo = b && b > 0 ? masterBpm / b : 1;
+    let tempo = b && b > 0 ? masterBpm / b : 1;
+    tempo *= track.rateMul ?? 1;
     if (!(b && b > 0)) {
       const ok = window.confirm(
         "推定BPMがありません。テンポ倍率 1.0（原曲の速さ）で書き出します。よろしいですか？",
@@ -822,7 +838,23 @@ function init() {
     }
   }
 
-  tracks.forEach((track, i) => {
+  tracks.forEach((track) => {
+    const rateMulEl = track.el.querySelector(".rate-mul");
+    if (rateMulEl instanceof HTMLInputElement) {
+      const v0 = parseFloat(rateMulEl.value);
+      track.rateMul = Number.isFinite(v0) && v0 > 0 ? v0 : 1;
+      rateMulEl.addEventListener("input", () => {
+        const v = parseFloat(rateMulEl.value);
+        track.rateMul = Number.isFinite(v) && v > 0 ? v : 1;
+        refreshTrackRateDisplay(track, masterBpmInput);
+        for (const { src, track: tr } of activeMix) {
+          if (tr === track) {
+            src.playbackRate.value = effectivePlaybackRate(tr, masterBpmInput);
+          }
+        }
+      });
+    }
+
     const fileIn = track.el.querySelector(".file-input");
     const estBtn = track.el.querySelector(".btn-estimate");
     const exportBtn = track.el.querySelector(".btn-export");
@@ -842,13 +874,13 @@ function init() {
         if (track.startOffsetSec > end - 0.01) {
           track.startOffsetSec = Math.max(0, end - 0.01);
         }
-        redrawTrackWave(track, i);
+        redrawTrackWave(track);
         refreshEditMeta(track);
       });
       editClear.addEventListener("click", () => {
         editEnd.value = "";
         track.editEndSec = null;
-        redrawTrackWave(track, i);
+        redrawTrackWave(track);
         refreshEditMeta(track);
       });
     }
@@ -874,6 +906,9 @@ function init() {
         track.originalName = null;
         track.startOffsetSec = 0;
         track.editEndSec = null;
+        track.rateMul = 1;
+        const rm = track.el.querySelector(".rate-mul");
+        if (rm instanceof HTMLInputElement) rm.value = "1";
         const editInp = track.el.querySelector(".edit-end");
         if (editInp instanceof HTMLInputElement) {
           editInp.value = "";
@@ -881,16 +916,53 @@ function init() {
         }
         refreshEditMeta(track);
         const canvas = track.el.querySelector(".wave");
-        if (canvas instanceof HTMLCanvasElement) drawWaveform(canvas, null, colors[i]);
+        if (canvas instanceof HTMLCanvasElement) {
+          const ci = Number(track.el.dataset.track) || 0;
+          drawWaveform(canvas, null, colors[ci] ?? "#6c9eff");
+        }
       }
     });
 
     estBtn.addEventListener("click", () => runEstimate(track));
 
-    exportBtn.addEventListener("click", () => exportPitchHoldWav(track, i, exportBtn));
+    exportBtn.addEventListener("click", () =>
+      exportPitchHoldWav(track, Number(track.el.dataset.track) || 0, exportBtn),
+    );
   });
 
-  tracks.forEach((track, idx) => attachWavePointerHandlers(track, idx));
+  tracks.forEach((track) => attachWavePointerHandlers(track));
+
+  if (layerStack) {
+    let dragLayer = null;
+    layerStack.querySelectorAll(".layer-head").forEach((head) => {
+      head.addEventListener("dragstart", (e) => {
+        dragLayer = head.closest(".track");
+        if (!dragLayer) return;
+        e.dataTransfer.setData("text/plain", dragLayer.dataset.track ?? "");
+        e.dataTransfer.effectAllowed = "move";
+        dragLayer.classList.add("layer-dragging");
+      });
+      head.addEventListener("dragend", () => {
+        dragLayer?.classList.remove("layer-dragging");
+        dragLayer = null;
+      });
+    });
+    const allowDrop = (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+    };
+    layerStack.addEventListener("dragover", allowDrop);
+    layerStack.querySelectorAll(".track").forEach((row) => {
+      row.addEventListener("dragover", allowDrop);
+    });
+    layerStack.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const id = e.dataTransfer.getData("text/plain");
+      const dragged = layerStack.querySelector(`[data-track="${id}"]`);
+      if (!dragged || layerStack.querySelectorAll(".track").length < 2) return;
+      layerStack.appendChild(dragged);
+    });
+  }
 
   function cancelBpmCommitTimer() {
     if (bpmCommitTimer) {
@@ -991,7 +1063,7 @@ function init() {
   btnStop.addEventListener("click", () => stopPlayback());
 
   window.addEventListener("resize", () => {
-    tracks.forEach((track, i) => redrawTrackWave(track, i));
+    tracks.forEach((track) => redrawTrackWave(track));
   });
 }
 
