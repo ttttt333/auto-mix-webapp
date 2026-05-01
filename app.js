@@ -263,7 +263,7 @@ function drawWaveform(canvas, buffer, color, playheadSec = null, rangeEndSec = n
 
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = canvas.clientWidth || canvas.width;
-  const h = 120;
+  const h = Math.max(40, Math.min(120, canvas.clientHeight || 56));
   canvas.width = Math.floor(w * dpr);
   canvas.height = Math.floor(h * dpr);
   ctx.scale(dpr, dpr);
