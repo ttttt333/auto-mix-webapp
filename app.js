@@ -9,28 +9,101 @@ const FRAME = 2048;
 /** MP3 ビットレート（固定） */
 const MP3_KBPS = 192;
 
-/** 固定バージョン（CDN import 用） */
-const SOUNDTOUCH_ESM = "https://esm.sh/@soundtouchjs/core@1.0.10";
-const LAMEJS_ESM = "https://esm.sh/lamejs@1.2.1";
+/** ピッチ保持（SoundTouch）・MP3（lamejs）は複数 CDN を順に試す */
+const SOUNDTOUCH_IMPORT_URLS = [
+  "https://cdn.jsdelivr.net/npm/@soundtouchjs/core@1.0.10/dist/index.js",
+  "https://esm.sh/@soundtouchjs/core@1.0.10",
+  "https://unpkg.com/@soundtouchjs/core@1.0.10/dist/index.js",
+];
 
-/** @type {Promise<Record<string, unknown>> | null} */
-let soundTouchModulePromise = null;
+const LAMEJS_IMPORT_URLS = [
+  "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/+esm",
+  "https://esm.sh/lamejs@1.2.1",
+];
 
-/** @type {Promise<unknown> | null} */
-let lameJsModulePromise = null;
+/** @type {Record<string, unknown> | null} */
+let soundTouchModuleCache = null;
 
-function loadSoundTouchModule() {
-  if (!soundTouchModulePromise) {
-    soundTouchModulePromise = import(/* @vite-ignore */ /* webpackIgnore: true */ SOUNDTOUCH_ESM);
-  }
-  return soundTouchModulePromise;
+/** @type {unknown} */
+let lameJsModuleCache = null;
+
+/**
+ * @param {unknown} mod
+ */
+function soundTouchModuleLooksValid(mod) {
+  if (!mod || typeof mod !== "object") return false;
+  const o = /** @type {{ SoundTouch?: unknown; SimpleFilter?: unknown; WebAudioBufferSource?: unknown }} */ (mod);
+  return (
+    typeof o.SoundTouch === "function" &&
+    typeof o.SimpleFilter === "function" &&
+    typeof o.WebAudioBufferSource === "function"
+  );
 }
 
-function loadLameJsModule() {
-  if (!lameJsModulePromise) {
-    lameJsModulePromise = import(/* @vite-ignore */ /* webpackIgnore: true */ LAMEJS_ESM);
+/**
+ * @param {unknown} mod
+ */
+function lameModuleLooksUsable(mod) {
+  const d =
+    mod && typeof mod === "object" && "default" in /** @type {object} */ (mod)
+      ? /** @type {{ default: unknown }} */ (mod).default
+      : mod;
+  const pick = (o) =>
+    o && typeof o === "object" && "Mp3Encoder" in /** @type {object} */ (o)
+      ? /** @type {{ Mp3Encoder: unknown }} */ (o).Mp3Encoder
+      : null;
+  return typeof pick(d) === "function" || typeof pick(mod) === "function";
+}
+
+async function loadSoundTouchModule() {
+  if (soundTouchModuleCache && soundTouchModuleLooksValid(soundTouchModuleCache)) {
+    return soundTouchModuleCache;
   }
-  return lameJsModulePromise;
+  soundTouchModuleCache = null;
+  const errors = [];
+  for (const url of SOUNDTOUCH_IMPORT_URLS) {
+    try {
+      const mod = await import(/* @vite-ignore */ /* webpackIgnore: true */ url);
+      if (soundTouchModuleLooksValid(mod)) {
+        soundTouchModuleCache = mod;
+        return soundTouchModuleCache;
+      }
+      errors.push(`${url} → エクスポート形式が想定と異なります`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`${url} → ${msg}`);
+    }
+  }
+  throw new Error(
+    `SoundTouch（ピッチ保持）をどの CDN からも読み込めませんでした。通信のブロックや一時障害の可能性があります。\n\n${errors.join("\n")}`,
+  );
+}
+
+async function loadLameJsModule() {
+  if (lameJsModuleCache && lameModuleLooksUsable(lameJsModuleCache)) {
+    return lameJsModuleCache;
+  }
+  lameJsModuleCache = null;
+  const errors = [];
+  for (const url of LAMEJS_IMPORT_URLS) {
+    try {
+      const mod = await import(/* @vite-ignore */ /* webpackIgnore: true */ url);
+      if (lameModuleLooksUsable(mod)) {
+        lameJsModuleCache = mod;
+        return lameJsModuleCache;
+      }
+      errors.push(`${url} → Mp3Encoder が見つかりません`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`${url} → ${msg}`);
+    }
+  }
+  throw new Error(`lamejs（MP3）をどの CDN からも読み込めませんでした。\n\n${errors.join("\n")}`);
+}
+
+/** 初回書き出しを速くするため、音源読み込み後に SoundTouch を先読み（失敗は無視） */
+function prefetchSoundTouchForExport() {
+  void loadSoundTouchModule().catch(() => {});
 }
 
 /** @param {Float32Array[]} parts */
@@ -888,6 +961,15 @@ function init() {
     track.estimatedBpm = null;
     setBpmDisplay(track, "—");
     refreshTrackRateDisplay(track, masterBpmInput);
+    prefetchSoundTouchForExport();
+  }
+
+  function restoreExportButtons(/** @type {HTMLButtonElement[]} */ buttons) {
+    for (const btn of buttons) {
+      btn.disabled = false;
+      if (btn.classList.contains("btn-export-wav")) btn.textContent = "WAV";
+      else if (btn.classList.contains("btn-export-mp3")) btn.textContent = "MP3";
+    }
   }
 
   async function runEstimate(track) {
@@ -925,7 +1007,6 @@ function init() {
       if (!ok) return;
     }
 
-    const labels = exportBtns.map((btn) => btn.textContent ?? "");
     for (const btn of exportBtns) btn.disabled = true;
     triggerBtn.textContent = "処理中…";
     try {
@@ -940,14 +1021,13 @@ function init() {
       downloadBlob(blob, name);
     } catch (err) {
       console.error(err);
+      let detail = err instanceof Error ? err.message : String(err);
+      if (detail.length > 900) detail = `${detail.slice(0, 900)}…`;
       window.alert(
-        "書き出しに失敗しました。初回はネットワークで SoundTouch / lamejs の取得が必要です。コンソールを確認してください。",
+        `書き出しに失敗しました。\n\n${detail}\n\n（初回のみピッチ保持用ライブラリをネットワークから読み込みます。社内 Wi‑Fi や広告ブロッカーで失敗することがあります。）`,
       );
     } finally {
-      exportBtns.forEach((btn, i) => {
-        btn.disabled = false;
-        btn.textContent = labels[i] ?? "";
-      });
+      restoreExportButtons(exportBtns);
     }
   }
 
