@@ -265,13 +265,51 @@ function downloadBlob(blob, filename) {
 }
 
 /**
- * SoundTouch でピッチ保持ストレッチし、16bit ステレオ PCM を小さなチャンクの配列で返す。
- * 全長分の Float32Array / 巨大な単一 ArrayBuffer を確保しない（Array buffer allocation failed 対策）。
+ * @param {number} pcmDataBytes data チャンクのバイト数（16bit ステレオインターリーブ全体）
+ * @param {number} sampleRate
+ */
+function buildWavHeaderBytes(pcmDataBytes, sampleRate) {
+  const numChannels = 2;
+  const bytesPerSample = 2;
+  const blockAlign = numChannels * bytesPerSample;
+  const buf = new ArrayBuffer(44);
+  const dv = new DataView(buf);
+  let o = 0;
+  const writeStr = (s) => {
+    for (let i = 0; i < s.length; i++) dv.setUint8(o++, s.charCodeAt(i));
+  };
+  writeStr("RIFF");
+  dv.setUint32(o, 36 + pcmDataBytes, true);
+  o += 4;
+  writeStr("WAVE");
+  writeStr("fmt ");
+  dv.setUint32(o, 16, true);
+  o += 4;
+  dv.setUint16(o, 1, true);
+  o += 2;
+  dv.setUint16(o, numChannels, true);
+  o += 2;
+  dv.setUint32(o, sampleRate, true);
+  o += 4;
+  dv.setUint32(o, sampleRate * blockAlign, true);
+  o += 4;
+  dv.setUint16(o, blockAlign, true);
+  o += 2;
+  dv.setUint16(o, 16, true);
+  o += 2;
+  writeStr("data");
+  dv.setUint32(o, pcmDataBytes, true);
+  o += 4;
+  return new Uint8Array(buf);
+}
+
+/**
+ * SoundTouch の各チャンクをコールバックへ渡す（蓄積しないストリーム用）
  * @param {AudioBuffer} inputBuffer
  * @param {number} tempo
- * @returns {Promise<{ pcmParts: Uint8Array[]; numPcmInt16Samples: number; sampleRate: number }>}
+ * @param {(u8: Uint8Array) => void | Promise<void>} onChunk
  */
-async function soundTouchStretchToPcm16Parts(inputBuffer, tempo) {
+async function forEachSoundTouchPcmChunk(inputBuffer, tempo, onChunk) {
   const ST = await loadSoundTouchModule();
   const SoundTouch = ST.SoundTouch;
   const SimpleFilter = ST.SimpleFilter;
@@ -301,8 +339,6 @@ async function soundTouchStretchToPcm16Parts(inputBuffer, tempo) {
 
   const chunkFrames = 4096;
   const chunk = new Float32Array(chunkFrames * 2);
-  /** @type {Uint8Array[]} */
-  const pcmParts = [];
   let numPcmInt16Samples = 0;
   let cycles = 0;
 
@@ -316,16 +352,64 @@ async function soundTouchStretchToPcm16Parts(inputBuffer, tempo) {
       const c = Math.max(-1, Math.min(1, x));
       i16[i] = c < 0 ? c * 0x8000 : c * 0x7fff;
     }
-    pcmParts.push(new Uint8Array(i16.buffer.slice(0)));
+    const u8 = new Uint8Array(i16.buffer, i16.byteOffset, i16.byteLength);
     numPcmInt16Samples += need;
     if (numPcmInt16Samples > MAX_EXPORT_INTERLEAVED_SAMPLES) {
       throw new Error("書き出し結果が大きすぎます。終了秒で範囲を狭めてください。");
     }
+    await onChunk(u8);
     cycles += 1;
     if (cycles % 8 === 0) await new Promise((r) => setTimeout(r, 0));
   }
 
-  return { pcmParts, numPcmInt16Samples, sampleRate: inputBuffer.sampleRate };
+  return { numPcmInt16Samples, sampleRate: inputBuffer.sampleRate };
+}
+
+/**
+ * Chrome / Edge: ファイルへ直接ストリーム書き込み（PCM を配列に溜めない）
+ * @param {AudioBuffer} sliced
+ * @param {number} tempo
+ * @param {string} suggestedName
+ */
+async function streamWavToDiskWithSoundTouch(sliced, tempo, suggestedName) {
+  const w = window;
+  if (typeof w.showSaveFilePicker !== "function") {
+    throw new Error("showSaveFilePicker 非対応");
+  }
+  const handle = await w.showSaveFilePicker({
+    suggestedName,
+    types: [
+      {
+        description: "WAV",
+        accept: { "audio/wav": [".wav"] },
+      },
+    ],
+  });
+  const writable = await handle.createWritable();
+  await writable.write(new Uint8Array(44));
+  let pcmBytes = 0;
+  const sr = sliced.sampleRate;
+  await forEachSoundTouchPcmChunk(sliced, tempo, async (u8) => {
+    await writable.write(u8);
+    pcmBytes += u8.length;
+  });
+  const hdr = buildWavHeaderBytes(pcmBytes, sr);
+  if (typeof writable.seek === "function") {
+    await writable.seek(0);
+  } else {
+    throw new Error("ファイル先頭へのシークができません。通常の書き出しにフォールバックしてください。");
+  }
+  await writable.write(hdr);
+  await writable.close();
+}
+
+async function soundTouchStretchToPcm16Parts(inputBuffer, tempo) {
+  /** @type {Uint8Array[]} */
+  const pcmParts = [];
+  const { numPcmInt16Samples, sampleRate } = await forEachSoundTouchPcmChunk(inputBuffer, tempo, async (u8) => {
+    pcmParts.push(new Uint8Array(u8));
+  });
+  return { pcmParts, numPcmInt16Samples, sampleRate };
 }
 
 /**
@@ -431,24 +515,32 @@ function estimateBpmFromMono(mono, sampleRate) {
 }
 
 /**
+ * 範囲を切り出し（OfflineAudioContext を使わずコピーのみ — メモリピーク低減）
  * @param {AudioBuffer} buffer
  * @param {number} startSec
  * @param {number} endSec
  */
-async function sliceAudioBuffer(buffer, startSec, endSec) {
+function sliceAudioBuffer(buffer, startSec, endSec) {
   const sr = buffer.sampleRate;
   const channels = buffer.numberOfChannels;
   const d = buffer.duration;
   const start = Math.max(0, Math.min(startSec, d - 0.001));
   const end = Math.max(start + 0.01, Math.min(endSec, d));
-  const dur = end - start;
-  const length = Math.max(1, Math.ceil(dur * sr));
-  const oac = new OfflineAudioContext(channels, length, sr);
-  const src = oac.createBufferSource();
-  src.buffer = buffer;
-  src.connect(oac.destination);
-  src.start(0, start, dur);
-  return oac.startRendering();
+  const startFrame = Math.floor(start * sr);
+  const endFrame = Math.ceil(end * sr);
+  const frameCount = Math.max(1, endFrame - startFrame);
+  const maxSrc = buffer.length;
+  const ctx = getContext();
+  const out = ctx.createBuffer(channels, frameCount, sr);
+  for (let c = 0; c < channels; c++) {
+    const src = buffer.getChannelData(c);
+    const dst = out.getChannelData(c);
+    const n = Math.min(frameCount, maxSrc - startFrame);
+    for (let i = 0; i < n; i++) {
+      dst[i] = src[startFrame + i];
+    }
+  }
+  return out;
 }
 
 /**
@@ -1080,13 +1172,27 @@ function init() {
     triggerBtn.textContent = "処理中…";
     try {
       const { start, end } = getPlayRange(track);
-      const sliced = await sliceAudioBuffer(track.buffer, start, end);
+      const sliced = sliceAudioBuffer(track.buffer, start, end);
+      const name = buildExportFilename(track.originalName, trackIndex, masterBpm, tempo, format);
+
+      if (format === "wav" && typeof window.showSaveFilePicker === "function") {
+        try {
+          await streamWavToDiskWithSoundTouch(sliced, tempo, name);
+          return;
+        } catch (e) {
+          const err = /** @type {{ name?: string }} */ (e);
+          if (err && err.name === "AbortError") {
+            return;
+          }
+          console.warn("ストリーム WAV 書き出しに失敗、メモリ内で組み立てます", e);
+        }
+      }
+
       const { pcmParts, numPcmInt16Samples, sampleRate } = await soundTouchStretchToPcm16Parts(sliced, tempo);
       const blob =
         format === "mp3"
           ? await pcmPartsToMp3Blob(pcmParts, numPcmInt16Samples, sampleRate, MP3_KBPS)
           : pcmPartsToWavBlob(pcmParts, numPcmInt16Samples, sampleRate);
-      const name = buildExportFilename(track.originalName, trackIndex, masterBpm, tempo, format);
       downloadBlob(blob, name);
     } catch (err) {
       console.error(err);

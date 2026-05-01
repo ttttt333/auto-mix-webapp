@@ -39,7 +39,7 @@
       <details class="details-inline">
         <summary>操作メモ・書き出し仕様</summary>
         <p class="hint hint-bpm">数値欄以外にフォーカスがあるとき <kbd>⌘/Ctrl</kbd>+<kbd>Z</kbd> で元に戻す、<kbd>Shift</kbd> 併用でやり直し。</p>
-        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。<strong>WAV</strong>は 16bit PCM（互換性・容量のバランス）、<strong>MP3</strong>は約 192kbps。どちらも SoundTouch でピッチ保持し、画面上の「合計」倍率（基準BPM・推定BPM・速さスライダー）と同じ速さで書き出します。初回書き出しのみ CDN で SoundTouch / lamejs を取得。<strong>再生</strong>はミックス枠のすぐ上にあります。</p>
+        <p class="hint">プレビューは <code>playbackRate</code>（音程も変化）。<strong>WAV</strong>は 16bit PCM。<strong>Chrome / Edge</strong> では保存先を選ぶとディスクへ直接書き込みし、長い曲でもメモリ不足になりにくくします。<strong>MP3</strong>は約 192kbps。どちらも SoundTouch でピッチ保持し、画面上の「合計」倍率と同じ速さで書き出します。初回のみ CDN で SoundTouch / lamejs を取得。<strong>再生</strong>はミックス枠のすぐ上にあります。</p>
       </details>
     </section>
 
