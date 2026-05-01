@@ -1,6 +1,7 @@
 /**
  * 波形描画・簡易BPM推定・基準BPMに合わせた playbackRate ミックス
  * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ（プレビューと同じ合計倍率）→ WAV（16bit PCM）または MP3（lamejs）
+ * （SimpleFilter.extract はソース終端後も 0 を返さないことがあるため、入力終端と理論出力長で打ち切る）
  */
 
 const HOP = 512;
@@ -101,9 +102,10 @@ async function loadLameJsModule() {
   throw new Error(`lamejs（MP3）をどの CDN からも読み込めませんでした。\n\n${errors.join("\n")}`);
 }
 
-/** 初回書き出しを速くするため、音源読み込み後に SoundTouch を先読み（失敗は無視） */
+/** 初回書き出しを速くするため、音源読み込み後に SoundTouch / lamejs を先読み（失敗は無視） */
 function prefetchSoundTouchForExport() {
   void loadSoundTouchModule().catch(() => {});
+  void loadLameJsModule().catch(() => {});
 }
 
 /** 書き出しのインターリーブ長（int16 要素数）の絶対上限 — 異常検知用 */
@@ -203,16 +205,12 @@ function pcmPartsToWavBlob(pcmParts, numPcmInt16Samples, sampleRate) {
 }
 
 /**
- * 16bit PCM チャンクを順に読み、MP3 化（全長の Float32 を保持しない）
- * @param {Uint8Array[]} pcmParts
- * @param {number} numPcmInt16Samples
- * @param {number} sampleRate
+ * SoundTouch の PCM を全長溜めず lamejs に流す（MP3 用。メモリピークを抑える）
+ * @param {AudioBuffer} inputBuffer
+ * @param {number} tempo
  * @param {number} kbps
  */
-async function pcmPartsToMp3Blob(pcmParts, numPcmInt16Samples, sampleRate, kbps) {
-  if (numPcmInt16Samples % 2 !== 0) {
-    throw new Error("内部エラー: ステレオサンプル数が偶数ではありません");
-  }
+async function soundTouchStretchToMp3Blob(inputBuffer, tempo, kbps) {
   const mod = await loadLameJsModule();
   const d =
     mod && typeof mod === "object" && "default" in /** @type {object} */ (mod) ? /** @type {{ default: unknown }} */ (mod).default : mod;
@@ -227,53 +225,39 @@ async function pcmPartsToMp3Blob(pcmParts, numPcmInt16Samples, sampleRate, kbps)
   if (typeof Mp3Encoder !== "function") {
     throw new Error("lamejs の Mp3Encoder が見つかりません");
   }
+  const sampleRate = inputBuffer.sampleRate;
   const enc = new Mp3Encoder(2, sampleRate, kbps);
   const left = new Int16Array(1152);
   const right = new Int16Array(1152);
-  const outParts = [];
-
-  let partIdx = 0;
-  let byteOff = 0;
-
-  const readNextPair = () => {
-    while (partIdx < pcmParts.length) {
-      const p = pcmParts[partIdx];
-      if (byteOff + 4 <= p.length) {
-        const dv = new DataView(p.buffer, p.byteOffset + byteOff, 4);
-        const L = dv.getInt16(0, true);
-        const R = dv.getInt16(2, true);
-        byteOff += 4;
-        if (byteOff >= p.length) {
-          partIdx += 1;
-          byteOff = 0;
-        }
-        return { L, R };
-      }
-      partIdx += 1;
-      byteOff = 0;
-    }
-    return null;
-  };
-
+  let partial = 0;
+  /** @type {Uint8Array[]} */
+  const mp3Parts = [];
   let cycles = 0;
-  while (true) {
-    let nFrames = 0;
-    while (nFrames < 1152) {
-      const pair = readNextPair();
-      if (!pair) break;
-      left[nFrames] = pair.L;
-      right[nFrames] = pair.R;
-      nFrames += 1;
+
+  await forEachSoundTouchPcmChunk(inputBuffer, tempo, async (u8) => {
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const lim = u8.byteLength - (u8.byteLength % 4);
+    for (let o = 0; o < lim; o += 4) {
+      left[partial] = dv.getInt16(o, true);
+      right[partial] = dv.getInt16(o + 2, true);
+      partial += 1;
+      if (partial === 1152) {
+        const buf = enc.encodeBuffer(left, right);
+        if (buf && buf.length > 0) mp3Parts.push(new Uint8Array(buf));
+        partial = 0;
+      }
     }
-    if (nFrames === 0) break;
-    const buf = enc.encodeBuffer(left.subarray(0, nFrames), right.subarray(0, nFrames));
-    if (buf && buf.length > 0) outParts.push(new Uint8Array(buf));
     cycles += 1;
-    if (cycles % 12 === 0) await new Promise((r) => setTimeout(r, 0));
+    if (cycles % 8 === 0) await new Promise((r) => setTimeout(r, 0));
+  });
+
+  if (partial > 0) {
+    const buf = enc.encodeBuffer(left.subarray(0, partial), right.subarray(0, partial));
+    if (buf && buf.length > 0) mp3Parts.push(new Uint8Array(buf));
   }
   const end = enc.flush();
-  if (end && end.length > 0) outParts.push(new Uint8Array(end));
-  return new Blob(outParts, { type: "audio/mpeg" });
+  if (end && end.length > 0) mp3Parts.push(new Uint8Array(end));
+  return new Blob(mp3Parts, { type: "audio/mpeg" });
 }
 
 /** @param {Blob} blob @param {string} filename */
@@ -1259,11 +1243,14 @@ function init() {
         }
       }
 
+      if (format === "mp3") {
+        const blob = await soundTouchStretchToMp3Blob(sliced, tempo, MP3_KBPS);
+        downloadBlob(blob, name);
+        return;
+      }
+
       const { pcmParts, numPcmInt16Samples, sampleRate } = await soundTouchStretchToPcm16Parts(sliced, tempo);
-      const blob =
-        format === "mp3"
-          ? await pcmPartsToMp3Blob(pcmParts, numPcmInt16Samples, sampleRate, MP3_KBPS)
-          : pcmPartsToWavBlob(pcmParts, numPcmInt16Samples, sampleRate);
+      const blob = pcmPartsToWavBlob(pcmParts, numPcmInt16Samples, sampleRate);
       downloadBlob(blob, name);
     } catch (err) {
       console.error(err);
