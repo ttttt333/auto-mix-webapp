@@ -1,6 +1,7 @@
 /**
- * 波形描画・簡易BPM推定・基準BPMに合わせた playbackRate ミックス
- * 書き出し: @soundtouchjs/core でピッチ保持タイムストレッチ（プレビューと同じ合計倍率）→ WAV（16bit PCM）または MP3（lamejs）
+ * 波形描画・簡易BPM推定・基準BPMに合わせたミックス
+ * プレビュー: @soundtouchjs/core の PitchShifter でピッチ保持（失敗時のみ playbackRate）
+ * 書き出し: SoundTouch でピッチ保持（プレビューと同じ合計倍率）→ WAV / MP3（lamejs）
  * （SimpleFilter.extract はソース終端後も 0 を返さないことがあるため、入力終端と理論出力長で打ち切る）
  */
 
@@ -43,11 +44,12 @@ let lameJsScriptLoadPromise = null;
  */
 function soundTouchModuleLooksValid(mod) {
   if (!mod || typeof mod !== "object") return false;
-  const o = /** @type {{ SoundTouch?: unknown; SimpleFilter?: unknown; WebAudioBufferSource?: unknown }} */ (mod);
+  const o = /** @type {{ SoundTouch?: unknown; SimpleFilter?: unknown; WebAudioBufferSource?: unknown; PitchShifter?: unknown }} */ (mod);
   return (
     typeof o.SoundTouch === "function" &&
     typeof o.SimpleFilter === "function" &&
-    typeof o.WebAudioBufferSource === "function"
+    typeof o.WebAudioBufferSource === "function" &&
+    typeof o.PitchShifter === "function"
   );
 }
 
@@ -133,6 +135,31 @@ async function loadSoundTouchModule() {
   throw new Error(
     `SoundTouch（ピッチ保持）をどの CDN からも読み込めませんでした。通信のブロックや一時障害の可能性があります。\n\n${errors.join("\n")}`,
   );
+}
+
+/**
+ * 書き出しと同じ Stretch パラメータで PitchShifter を初期化する
+ * @param {AudioContext} ctx
+ * @param {AudioBuffer} sliced
+ * @param {number} tempo
+ * @param {number} bufferSize ScriptProcessor バッファ（256 の倍数推奨）
+ * @param {() => void} [onEnd]
+ */
+async function createPitchShifterForPreview(ctx, sliced, tempo, bufferSize, onEnd = () => {}) {
+  const mod = await loadSoundTouchModule();
+  const PitchShifter = /** @type {{ PitchShifter: new (c: AudioContext, b: AudioBuffer, n: number, cb?: () => void) => { connect: (n: AudioNode) => void; disconnect: () => void; tempo: number; pitch: number; rate: number } }} */ (mod).PitchShifter;
+  if (typeof PitchShifter !== "function") {
+    throw new Error("PitchShifter がありません");
+  }
+  const ps = new PitchShifter(ctx, sliced, bufferSize, onEnd);
+  const inner = /** @type {{ _soundtouch?: { stretch: { setParameters: (sr: number, a: number, b: number, o: number) => void } } }} */ (/** @type {unknown} */ (ps));
+  if (inner._soundtouch?.stretch) {
+    inner._soundtouch.stretch.setParameters(sliced.sampleRate, 0, 0, 8);
+  }
+  ps.pitch = 1;
+  ps.rate = 1;
+  ps.tempo = tempo;
+  return ps;
 }
 
 async function loadLameJsModule() {
@@ -818,15 +845,21 @@ function updateRatesFromMaster(tracks, masterInput) {
   for (const t of tracks) {
     refreshTrackRateDisplay(t, masterInput);
   }
-  for (const { src, track: tr } of activeMix) {
-    src.playbackRate.value = effectivePlaybackRate(tr, masterInput);
+  for (const entry of activeMix) {
+    const tr = entry.track;
+    const rate = effectivePlaybackRate(tr, masterInput);
+    if (entry.shifter) {
+      entry.shifter.tempo = rate;
+    } else if (entry.src) {
+      entry.src.playbackRate.value = rate;
+    }
   }
 }
 
 /** @type {AudioBufferSourceNode[]} */
 let activeSources = [];
 
-/** @type {{ src: AudioBufferSourceNode; track: TrackState }[]} */
+/** @type {Array<{ track: TrackState; shifter?: { disconnect: () => void; connect: (n: AudioNode) => void; tempo: number }; src?: AudioBufferSourceNode }>} */
 let activeMix = [];
 
 /** @type {(() => void)[]} */
@@ -850,23 +883,37 @@ function stopPlayback() {
     }
   }
   activeSources = [];
+  for (const entry of activeMix) {
+    if (entry.shifter) {
+      try {
+        entry.shifter.disconnect();
+      } catch {
+        /* ignore */
+      }
+    } else if (entry.src) {
+      try {
+        entry.src.stop();
+      } catch {
+        /* already stopped */
+      }
+      try {
+        entry.src.disconnect();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
   activeMix = [];
 }
 
 /**
+ * SoundTouch 非対応時: 従来どおり playbackRate（音程も変わる）
  * @param {TrackState[]} tracks
  * @param {HTMLInputElement} masterInput
+ * @param {AudioContext} ctx
+ * @param {GainNode} masterGain
  */
-async function playMix(tracks, masterInput) {
-  const ctx = getContext();
-  if (ctx.state === "suspended") await ctx.resume();
-
-  stopPlayback();
-
-  const masterGain = ctx.createGain();
-  masterGain.gain.value = 0.85;
-  masterGain.connect(ctx.destination);
-
+function playMixWithPlaybackRateOnly(tracks, masterInput, ctx, masterGain) {
   for (const t of tracks) {
     if (!t.buffer) continue;
     const src = ctx.createBufferSource();
@@ -893,6 +940,65 @@ async function playMix(tracks, masterInput) {
     src.start(0, start, duration);
     activeSources.push(src);
     activeMix.push({ src, track: t });
+  }
+}
+
+/**
+ * @param {TrackState[]} tracks
+ * @param {HTMLInputElement} masterInput
+ */
+async function playMix(tracks, masterInput) {
+  const ctx = getContext();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  stopPlayback();
+
+  const masterGain = ctx.createGain();
+  masterGain.gain.value = 0.85;
+  masterGain.connect(ctx.destination);
+
+  /** @type {Array<{ track: TrackState; shifter?: { disconnect: () => void; connect: (n: AudioNode) => void; tempo: number }; src?: AudioBufferSourceNode }>} */
+  const pending = [];
+  try {
+    await loadSoundTouchModule();
+    for (const t of tracks) {
+      if (!t.buffer) continue;
+      const { start, end } = getPlayRange(t);
+      const sliced = sliceAudioBuffer(t.buffer, start, end);
+      const tempo = effectivePlaybackRate(t, masterInput);
+      const shifter = await createPitchShifterForPreview(ctx, sliced, tempo, 4096, () => {});
+
+      const g = ctx.createGain();
+      const slider = t.el.querySelector(".gain");
+      const vol = slider instanceof HTMLInputElement ? parseFloat(slider.value) : 0.7;
+      g.gain.value = Number.isFinite(vol) ? vol : 0.7;
+
+      if (slider instanceof HTMLInputElement) {
+        const onInput = () => {
+          const v = parseFloat(slider.value);
+          g.gain.value = Number.isFinite(v) ? v : 0;
+        };
+        slider.addEventListener("input", onInput);
+        mixCleanup.push(() => slider.removeEventListener("input", onInput));
+      }
+
+      shifter.connect(g);
+      g.connect(masterGain);
+      pending.push({ shifter, track: t });
+    }
+    activeMix = pending;
+  } catch (e) {
+    for (const p of pending) {
+      if (p.shifter) {
+        try {
+          p.shifter.disconnect();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    console.warn("ピッチ保持プレビューに失敗。playbackRate で再生します。", e);
+    playMixWithPlaybackRateOnly(tracks, masterInput, ctx, masterGain);
   }
 }
 
@@ -1082,8 +1188,23 @@ function init() {
   let scrubSource = null;
   /** @type {GainNode | null} */
   let scrubGain = null;
+  /** @type {{ shifter: { disconnect: () => void }; gain: GainNode } | null} */
+  let scrubPitch = null;
 
   stopScrubPreviewFn = () => {
+    if (scrubPitch) {
+      try {
+        scrubPitch.shifter.disconnect();
+      } catch {
+        /* ignore */
+      }
+      try {
+        scrubPitch.gain.disconnect();
+      } catch {
+        /* ignore */
+      }
+      scrubPitch = null;
+    }
     if (scrubSource) {
       try {
         scrubSource.stop();
@@ -1115,6 +1236,24 @@ function init() {
     const buf = track.buffer;
     const { start, end } = getPlayRange(track);
     const clamped = Math.max(start, Math.min(offsetSec, end - 0.0005));
+    try {
+      const sliced = sliceAudioBuffer(buf, clamped, end);
+      const shifter = await createPitchShifterForPreview(
+        ctx,
+        sliced,
+        effectivePlaybackRate(track, masterBpmInput),
+        2048,
+        () => {},
+      );
+      const g = ctx.createGain();
+      g.gain.value = 0.75;
+      shifter.connect(g);
+      g.connect(ctx.destination);
+      scrubPitch = { shifter, gain: g };
+      return;
+    } catch {
+      /* SoundTouch 未使用時など */
+    }
     const playDur = Math.max(0.01, end - clamped);
     const src = ctx.createBufferSource();
     src.buffer = buf;
@@ -1343,9 +1482,15 @@ function init() {
         const v = parseFloat(rateMulEl.value);
         track.rateMul = Number.isFinite(v) && v > 0 ? v : 1;
         refreshTrackRateDisplay(track, masterBpmInput);
-        for (const { src, track: tr } of activeMix) {
-          if (tr === track) {
-            src.playbackRate.value = effectivePlaybackRate(tr, masterBpmInput);
+        for (const entry of activeMix) {
+          if (entry.track === track) {
+            const r = effectivePlaybackRate(tr, masterBpmInput);
+            if (entry.shifter) {
+              entry.shifter.tempo = r;
+            } else if (entry.src) {
+              entry.src.playbackRate.value = r;
+            }
+            break;
           }
         }
       });
